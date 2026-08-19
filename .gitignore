@@ -1,0 +1,4 @@
+.DS_Store
+firmware/build/
+enclosure/stl/
+.claude/settings.local.json
