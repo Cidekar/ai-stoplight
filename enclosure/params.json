@@ -1,0 +1,65 @@
+{
+  "_comment": "Single source of truth for enclosure dimensions, in mm. Read by stoplight.scad, gen_stl.py and gen_docs.py. Edit here and nowhere else, then run `python3 gen_stl.py` to regenerate.",
+
+  "print": {
+    "fit": 0.20,
+    "slack": 1.00,
+    "resolution": 0.5
+  },
+
+  "components": {
+    "board_l": 25.0,
+    "board_w": 20.5,
+    "board_h": 6.0,
+    "batt_l": 35.0,
+    "batt_w": 30.0,
+    "batt_h": 5.0,
+    "chg_l": 26.0,
+    "chg_w": 17.0,
+    "chg_h": 4.0,
+    "led_dia": 5.0,
+    "led_hole": 5.2,
+    "btn_body": 6.0,
+    "btn_h": 5.0,
+    "screen_lit_w": 9.2,
+    "screen_lit_h": 5.2
+  },
+
+  "shell": {
+    "wall": 2.0,
+    "top_wall": 3.0,
+    "inner_d": 14.0,
+    "btn_sect": 8.0,
+    "scr_sect": 26.0
+  },
+
+  "lens": {
+    "dia": 10.0,
+    "deep": 12.0,
+    "thick": 5.0,
+    "pitch": 12.5
+  },
+
+  "button": {
+    "plunger_dia": 4.0,
+    "recess_dia": 9.0,
+    "recess_depth": 1.2
+  },
+
+  "board_retention": {
+    "tab_t": 1.6,
+    "tab_w": 4.0
+  },
+
+  "visor": {
+    "out": 7.0,
+    "thickness": 1.6
+  },
+
+  "openings": {
+    "screen_w": 12.0,
+    "screen_h": 10.0,
+    "usb_w": 10.0,
+    "usb_h": 6.0
+  }
+}
