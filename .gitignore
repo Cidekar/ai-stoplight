@@ -1,4 +1,5 @@
 .DS_Store
 firmware/build/
+firmware/test/build/
 enclosure/stl/
 .claude/settings.local.json
