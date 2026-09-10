@@ -321,6 +321,9 @@ Claude Code emits hooks on session events, so its adapter is a table and an inst
 | `UserPromptSubmit` | `started` |
 | `Notification` | `blocked` |
 | `Stop` | `finished` |
+| `SessionEnd` | `ended` |
+
+`SessionEnd` is what makes a session leave. Without it the only removal paths are an explicit `ended` from some other producer and the silence timeout, and a session that keeps emitting events is never silent: a background agent that reports `blocked` every few minutes refreshes its own keepalive and holds the lamp red indefinitely. `SessionEnd` fires on `exit`, on Ctrl-D and on abnormal termination, so the session that a human has closed is the session that leaves the light.
 
 Install writes these entries into that tool's config, each invoking `stoplight notify`, which posts to the relay and exits 0 unconditionally.
 
