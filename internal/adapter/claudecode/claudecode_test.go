@@ -37,6 +37,7 @@ func TestMappingMatchesTheRFC(t *testing.T) {
 		{Hook: "UserPromptSubmit", Event: "started"},
 		{Hook: "Notification", Event: "blocked"},
 		{Hook: "Stop", Event: "finished"},
+		{Hook: "SessionEnd", Event: "ended"},
 	}
 	if len(mappings) != len(want) {
 		t.Fatalf("got %d mappings, want %d", len(mappings), len(want))

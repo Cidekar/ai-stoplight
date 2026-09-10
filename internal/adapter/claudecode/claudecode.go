@@ -38,6 +38,7 @@ var mappings = []hookMapping{
 	{Hook: "UserPromptSubmit", Event: "started"},
 	{Hook: "Notification", Event: "blocked"},
 	{Hook: "Stop", Event: "finished"},
+	{Hook: "SessionEnd", Event: "ended"},
 }
 
 // Adapter installs Stoplight's hooks into Claude Code's settings.json.
