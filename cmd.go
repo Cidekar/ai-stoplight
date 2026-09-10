@@ -199,6 +199,7 @@ func cmdRelay(args []string, stdout, stderr io.Writer) int {
 		Transport:      tr,
 		SessionTimeout: *timeout,
 		ListenAddr:     *addr,
+		Pollers:        installedPollers(),
 	})
 	if err != nil {
 		fmt.Fprintf(stderr, "stoplight: %v\n", err)
@@ -587,6 +588,33 @@ func cmdUninstall(args []string, stdout, stderr io.Writer) int {
 		return exitError
 	}
 	return exitOK
+}
+
+// installedPollers returns the adapters that can be polled for a full session
+// list, per RFC 1 section 10.1, and that are actually installed.
+//
+// Both halves matter. An adapter that affords no query is not a Poller and
+// contributes nothing. An adapter that is a Poller but is NOT installed is
+// skipped too: polling it would shell out to an agent the user never wired up,
+// once per interval, forever, to be told nothing is running. An agent whose
+// hooks are absent is an agent this relay was not asked to watch.
+//
+// An adapter that cannot say whether it is installed is skipped. The question
+// failing means its configuration could not be read, and a poller is a
+// correction to hooks that in that case are equally unreadable.
+func installedPollers() []adapter.Poller {
+	var pollers []adapter.Poller
+	for _, a := range adapter.All() {
+		p, ok := a.(adapter.Poller)
+		if !ok {
+			continue
+		}
+		if installed, err := a.Installed(); err != nil || !installed {
+			continue
+		}
+		pollers = append(pollers, p)
+	}
+	return pollers
 }
 
 // cmdStatus prints the service state, whether the relay is listening, and the

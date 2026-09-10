@@ -77,15 +77,12 @@ func NewTracker(sessionTimeout time.Duration) *Tracker {
 // session held the lamp red for the whole gap between two sweeps. A relay whose
 // ticker is slow, stalled or absent must still not show a stale red.
 func (t *Tracker) Apply(r Report, now time.Time) (changed bool) {
-	event, ok := ParseEvent(r.Event)
-	if !ok {
-		return false
-	}
-
 	// Truncate before anything reads these, so the truncated ID is the map key
 	// and a repeat report from the same oversized ID finds the same session.
-	id := truncate(r.SessionID, MaxSessionIDLen)
-	if id == "" {
+	if truncate(r.SessionID, MaxSessionIDLen) == "" {
+		return false
+	}
+	if _, ok := ParseEvent(r.Event); !ok {
 		return false
 	}
 
@@ -95,7 +92,38 @@ func (t *Tracker) Apply(r Report, now time.Time) (changed bool) {
 	// Expire the silent before this report is folded in. The reporting session
 	// is exempt: the report it just sent is its keepalive, and its LastSeen is
 	// set below.
-	t.expireSilentLocked(now, id)
+	t.expireSilentLocked(now, truncate(r.SessionID, MaxSessionIDLen))
+
+	if !t.applyLocked(r, now, time.Time{}) {
+		return t.commitLocked()
+	}
+
+	t.dropExpiredLocked()
+	return t.commitLocked()
+}
+
+// applyLocked folds one report into the session set. It reports whether the
+// session exists afterwards, which is false for an `ended` naming a session
+// the relay never tracked.
+//
+// observedAt is when the producer read this state, or the zero time when it
+// did not say. Split out of Apply so that a full-state sync folds each of its
+// entries through exactly the same label derivation, truncation, parked-label
+// and transition logic as a single report: two code paths that agreed only by
+// inspection would drift, and the sync path is the one nobody watches.
+//
+// The caller holds the lock, has already expired the silent, and calls
+// commitLocked afterwards.
+func (t *Tracker) applyLocked(r Report, now, observedAt time.Time) (exists bool) {
+	event, ok := ParseEvent(r.Event)
+	if !ok {
+		return false
+	}
+
+	id := truncate(r.SessionID, MaxSessionIDLen)
+	if id == "" {
+		return false
+	}
 
 	session, found := t.sessions[id]
 	if !found {
@@ -105,7 +133,7 @@ func (t *Tracker) Apply(r Report, now time.Time) (changed bool) {
 		initial, create := InitialState(event)
 		if !create {
 			// `ended` for a session we never tracked. Nothing to expire.
-			return t.commitLocked()
+			return false
 		}
 		session = &Session{
 			ID:      id,
@@ -162,6 +190,103 @@ func (t *Tracker) Apply(r Report, now time.Time) (changed bool) {
 	if next, moved := session.State.Next(event); moved {
 		session.State = next
 		t.dirty = true
+	}
+
+	// Record the observation last, so an entry that was folded in is the one
+	// whose timestamp is kept. A zero observedAt leaves any existing stamp
+	// alone: a hook that says nothing about when it read the world must not
+	// erase a poll's claim to have read it later.
+	if !observedAt.IsZero() && observedAt.After(session.observedAt) {
+		session.observedAt = observedAt
+	}
+
+	return true
+}
+
+// Sync is a producer's complete set of live sessions, per RFC 1 section 5.4.
+type Sync struct {
+	Provider   string    `json:"provider"`
+	ObservedAt time.Time `json:"observed_at"`
+	Sessions   []Report  `json:"sessions"`
+}
+
+// Reconcile applies a producer's complete set of live sessions, per RFC 1
+// section 5.4. Returns true if the resulting Frame differs from the last one.
+//
+// This is the only entry point where ABSENCE means something. Apply cannot
+// express "and nothing else": a producer reporting one session at a time has
+// no way to say a session it never mentioned has gone, so a session that ended
+// without a final event stays lit forever. A declared whole makes the gap
+// expressible, and closing it is the entire reason this method exists.
+//
+// # Authority is scoped to one provider
+//
+// A sync speaks only for the producer that sent it. Sessions belonging to any
+// other provider are left untouched, because two producers polling on their
+// own schedules would otherwise delete each other's work on every tick: one
+// declares its two sessions, the relay drops the other's three, and the next
+// tick reverses it. The lamp would oscillate for as long as both ran.
+//
+// A session the relay holds with NO provider is also left alone. It arrived
+// before any producer identified itself, so no sync can honestly claim it.
+//
+// # Ordering is by observation, not arrival
+//
+// Each entry is ignored if the session already holds a strictly newer
+// observation. A full-state poll is slower to produce and slower to send than
+// a single hook, so a sync can land after a delta that already superseded it.
+// Applying it anyway would reverse the fresher reading, which in the case that
+// matters means a session that just went red going back to green.
+//
+// The same test governs the removals: a session observed more recently than
+// this sync is not removed by it. Otherwise a session that started after the
+// poll was taken would be deleted for the crime of not existing yet.
+func (t *Tracker) Reconcile(sync Sync, now time.Time) (changed bool) {
+	provider := truncate(sync.Provider, MaxProviderLen)
+	if provider == "" {
+		return false
+	}
+
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	t.expireSilentLocked(now, "")
+
+	// Fold in everything declared. Reuse the per-report path so that label
+	// derivation, truncation, parked labels and state transitions behave
+	// identically however a report arrived.
+	declared := make(map[string]bool, len(sync.Sessions))
+	for _, entry := range sync.Sessions {
+		id := truncate(entry.SessionID, MaxSessionIDLen)
+		if id == "" {
+			continue
+		}
+		declared[id] = true
+
+		if existing, found := t.sessions[id]; found && sync.ObservedAt.Before(existing.observedAt) {
+			// A newer observation already landed for this session. Keep it,
+			// but still count the session as declared so it survives the
+			// removal pass below.
+			continue
+		}
+		entry.Provider = provider
+		t.applyLocked(entry, now, sync.ObservedAt)
+	}
+
+	// Remove what this provider no longer claims. RFC 1 section 5.4: absent
+	// means ended.
+	for id, session := range t.sessions {
+		switch {
+		case declared[id]:
+		case session.Provider != provider:
+			// Another producer's session, or one that never named a provider.
+		case session.observedAt.After(sync.ObservedAt):
+			// Observed more recently than this sync was taken, so this sync
+			// cannot speak to whether it exists.
+		default:
+			delete(t.sessions, id)
+			t.dirty = true
+		}
 	}
 
 	t.dropExpiredLocked()

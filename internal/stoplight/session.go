@@ -28,7 +28,23 @@ type Session struct {
 	// Unexported: this is bookkeeping for the tracker, not part of the session
 	// a caller reads.
 	labelSent bool
+
+	// observedAt is when the producer read the state this session holds, which
+	// is not when the relay received it. RFC 1 section 5.4 makes it the
+	// ordering key: a poll and a hook describing the same session travel at
+	// different speeds, so a slow full-state sync can arrive after a fast
+	// delta that supersedes it. Comparing arrival time would let the stale
+	// read win and turn a session that just went red back to green.
+	//
+	// Zero for a report that carried no timestamp, which is every report to
+	// /v1/session. A zero observation never loses a comparison, so ordering
+	// only constrains producers that opt into it.
+	observedAt time.Time
 }
+
+// ObservedAt reports when the producer read this session's state, or the zero
+// time if it never said.
+func (s *Session) ObservedAt() time.Time { return s.observedAt }
 
 // Display is the label actually shown, override first.
 func (s *Session) Display() string {
