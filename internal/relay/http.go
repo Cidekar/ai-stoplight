@@ -18,6 +18,10 @@ const (
 
 	// TaskPath sets an explicit screen label, as `stoplight task` does.
 	TaskPath = "/v1/task"
+
+	// SyncPath is the full-state endpoint from RFC 1 section 5.4, where a
+	// producer declares every session it has live and absence means ended.
+	SyncPath = "/v1/sessions"
 )
 
 // httpHandler builds the mux. Only the paths above are served: anything else
@@ -27,6 +31,7 @@ func (r *Relay) httpHandler() http.Handler {
 	mux.HandleFunc(SessionPath, r.handleSession)
 	mux.HandleFunc(StatusPath, r.handleStatus)
 	mux.HandleFunc(TaskPath, r.handleTask)
+	mux.HandleFunc(SyncPath, r.handleSync)
 	return mux
 }
 
@@ -125,6 +130,38 @@ func (r *Relay) handleSession(w http.ResponseWriter, req *http.Request) {
 	defer req.Body.Close()
 
 	changed, err := r.ingest(readBody(w, req))
+	if err != nil {
+		writeIngestError(w, err)
+		return
+	}
+
+	if changed {
+		r.transmit()
+	}
+
+	// 204 carries no body, per RFC 1 section 6.
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// handleSync implements POST /v1/sessions, the full-state endpoint from RFC 1
+// section 5.4.
+//
+//	204  accepted
+//	400  malformed JSON, or a missing provider or observed_at
+//	405  any method other than POST
+//	413  body over MaxSyncBodyBytes
+//
+// The body cap is larger than every other endpoint's because a sync carries
+// many sessions where the others carry one. It is still a cap: a producer
+// declaring more sessions than the relay will track is describing a machine
+// this device cannot usefully show.
+func (r *Relay) handleSync(w http.ResponseWriter, req *http.Request) {
+	if !requireMethod(w, req, http.MethodPost) {
+		return
+	}
+	defer req.Body.Close()
+
+	changed, err := r.reconcile(http.MaxBytesReader(w, req.Body, MaxSyncBodyBytes))
 	if err != nil {
 		writeIngestError(w, err)
 		return

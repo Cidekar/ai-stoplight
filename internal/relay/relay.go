@@ -22,6 +22,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/cidekar/stoplight/internal/adapter"
 	"github.com/cidekar/stoplight/internal/stoplight"
 	"github.com/cidekar/stoplight/internal/transport"
 )
@@ -43,6 +44,21 @@ const (
 
 	// MaxBodyBytes caps an ingest request at 8KB, per RFC 1 section 12.
 	MaxBodyBytes = 8 << 10
+
+	// DefaultPollInterval is how often a Poller is asked for its agent's
+	// full session list.
+	//
+	// Longer than the sweep, because a poll spawns a child process where a
+	// sweep walks a map. It is a correction rather than the primary signal:
+	// hooks move the lamp immediately, and this catches what they cannot see,
+	// so the interval only bounds how long a stale session can linger.
+	DefaultPollInterval = 20 * time.Second
+
+	// MaxSyncBodyBytes caps a full-state sync at 64KB, per RFC 1 section 5.4.
+	// A sync carries every live session where ingest carries one, and the
+	// tracker's own cap of MaxSessions entries at the Appendix A field sizes
+	// fits inside this comfortably.
+	MaxSyncBodyBytes = 64 << 10
 )
 
 // reconnectPollInterval is how often the run loop re-examines the transport's
@@ -84,6 +100,18 @@ type Config struct {
 	// SweepInterval is how often to expire silent sessions.
 	// Defaults to DefaultSweepInterval.
 	SweepInterval time.Duration
+
+	// Pollers are adapters that can be asked for their agent's full session
+	// list, per RFC 1 section 10.1. Empty is the normal case: an agent that
+	// only affords hooks contributes no poller, and the relay never polls.
+	//
+	// The relay owns the schedule so that a poll cannot land on a hook's code
+	// path, where it would hold the agent up for as long as the query took.
+	Pollers []adapter.Poller
+
+	// PollInterval is how often each poller is asked. Defaults to
+	// DefaultPollInterval.
+	PollInterval time.Duration
 
 	// ListenAddr is the HTTP ingest address. Defaults to DefaultListenAddr.
 	// It MUST resolve to a loopback address: NewRelay rejects anything else,
@@ -223,6 +251,9 @@ func NewRelay(cfg Config) (*Relay, error) {
 	if cfg.SweepInterval <= 0 {
 		cfg.SweepInterval = DefaultSweepInterval
 	}
+	if cfg.PollInterval <= 0 {
+		cfg.PollInterval = DefaultPollInterval
+	}
 	if cfg.ListenAddr == "" {
 		cfg.ListenAddr = DefaultListenAddr
 	}
@@ -351,6 +382,92 @@ func (r *Relay) ingest(body io.Reader) (changed bool, err error) {
 	}
 
 	return r.tracker.Apply(report, r.now()), nil
+}
+
+// reconcile decodes a full-state sync and applies it, per RFC 1 section 5.4.
+//
+// Unlike ingest, an entry naming an unknown event is dropped rather than
+// making the whole sync a no-op. A sync is a set of independent claims about
+// separate sessions, and one entry a later spec added must not cost the
+// removals the rest of the request implies: that would leave a session lit
+// forever on the strength of a field this relay does not read.
+func (r *Relay) reconcile(body io.Reader) (changed bool, err error) {
+	var sync stoplight.Sync
+	if err := decodeJSON(body, &sync); err != nil {
+		return false, err
+	}
+	if sync.Provider == "" {
+		return false, &badRequestError{err: errors.New("missing provider")}
+	}
+	if sync.ObservedAt.IsZero() {
+		return false, &badRequestError{err: errors.New("missing observed_at")}
+	}
+
+	keep := make([]stoplight.Report, 0, len(sync.Sessions))
+	for _, entry := range sync.Sessions {
+		if err := entry.Validate(); err != nil {
+			continue
+		}
+		if _, ok := stoplight.ParseEvent(entry.Event); !ok {
+			continue
+		}
+		keep = append(keep, entry)
+	}
+	sync.Sessions = keep
+
+	return r.tracker.Reconcile(sync, r.now()), nil
+}
+
+// newPollTicker returns a ticker that fires on interval, or one that never
+// fires when there is nothing to poll.
+//
+// A nil channel blocks forever in a select, which is what "no pollers" should
+// cost: nothing. Guarding the case here keeps the loop body free of a
+// conditional that would otherwise have to be right in two places.
+func newPollTicker(interval time.Duration, enabled bool) *time.Ticker {
+	if !enabled {
+		return &time.Ticker{C: nil}
+	}
+	return time.NewTicker(interval)
+}
+
+// pollAll asks every configured poller for its agent's full session list and
+// reconciles each answer, per RFC 1 section 10.1.
+//
+// Each poll runs in its own goroutine because it spawns a child process and
+// waits on it. Doing that inline would stall the run loop for the length of
+// the query, which delays the sweep and, worse, delays the transmit that a
+// hook arriving in the meantime asked for.
+//
+// A poll that fails is logged once and otherwise ignored. RFC 1 section 5.4
+// distinguishes an empty answer from no answer: an agent that reports nothing
+// live means remove everything, but an agent that could not be asked means
+// leave its sessions exactly where they are. Treating a failed query as an
+// empty one would clear the whole light every time the command was missing.
+func (r *Relay) pollAll(ctx context.Context, wg *sync.WaitGroup) {
+	for _, poller := range r.cfg.Pollers {
+		wg.Add(1)
+		go func(p adapter.Poller) {
+			defer wg.Done()
+
+			sessions, observedAt, err := p.Poll(ctx)
+			if err != nil {
+				// Cancellation on shutdown is not a fault worth logging.
+				if ctx.Err() == nil {
+					r.logger.Printf("poll %s: %v", p.Name(), err)
+				}
+				return
+			}
+
+			if r.tracker.Reconcile(stoplight.Sync{
+				Provider:   p.Provider(),
+				ObservedAt: observedAt,
+				Sessions:   sessions,
+			}, r.now()) {
+				r.transmit()
+			}
+		}(poller)
+	}
 }
 
 // badRequestError marks a payload the producer got wrong: malformed JSON, or a
@@ -542,6 +659,21 @@ func (r *Relay) loop(ctx context.Context) {
 	reconnect := time.NewTicker(reconnectPollInterval)
 	defer reconnect.Stop()
 
+	// pollWG keeps a poll's goroutine from outliving the loop, the same way
+	// reconnectWG does for Connect.
+	var pollWG sync.WaitGroup
+	defer pollWG.Wait()
+
+	poll := newPollTicker(r.cfg.PollInterval, len(r.cfg.Pollers) > 0)
+	defer poll.Stop()
+
+	// Sync once at startup, before waiting out the first interval. A relay
+	// holds state in memory and loses it on restart, and frames are sent only
+	// on change, so a session merely sitting idle is invisible until it next
+	// moves. RFC 1 section 5.4 asks producers to sync on start for exactly
+	// this; the relay does it on their behalf for the ones it can ask.
+	r.pollAll(ctx, &pollWG)
+
 	wasConnected := r.cfg.Transport.Connected()
 
 	for {
@@ -553,6 +685,9 @@ func (r *Relay) loop(ctx context.Context) {
 			if r.tracker.Sweep(r.now()) {
 				r.transmit()
 			}
+
+		case <-poll.C:
+			r.pollAll(ctx, &pollWG)
 
 		case <-reconnect.C:
 			connected := r.cfg.Transport.Connected()

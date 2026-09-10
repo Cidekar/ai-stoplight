@@ -6,7 +6,13 @@
 // vendor's vocabulary out of the core. See RFC 1 section 10.
 package adapter
 
-import "sort"
+import (
+	"context"
+	"sort"
+	"time"
+
+	"github.com/cidekar/stoplight/internal/stoplight"
+)
 
 // Adapter installs and removes the hook entries that make one agent
 // report to the relay.
@@ -29,6 +35,41 @@ type Adapter interface {
 
 	// Installed reports whether this adapter's entries are present.
 	Installed() (bool, error)
+}
+
+// Poller is an adapter that can be asked for its agent's complete set of
+// live sessions, per RFC 1 section 10.1.
+//
+// It is OPTIONAL. Most agents afford no way to ask, so an adapter that only
+// installs hooks does not implement this and the relay simply never polls it.
+//
+// Polling exists for what reporting on change cannot see. A hook reports only
+// what the agent chooses to report, so what it omits is invisible: a session
+// that ends without a final event stays lit, and a session the agent never
+// announced is never named. A poll returns the whole set, which makes an
+// absence expressible and lets the relay end what is gone.
+//
+// The relay owns the schedule. An implementation MUST NOT poll on its own
+// timer, and MUST NOT be called from a hook's code path: querying an agent for
+// its full state is far slower than the 250ms RFC 1 section 6 holds producers
+// to, and a hook runs while the agent waits for it.
+type Poller interface {
+	Adapter
+
+	// Provider is the name this adapter's sessions are recorded under. It
+	// scopes reconciliation: a sync speaks only for its own provider, so
+	// this must match what the adapter's hooks send.
+	Provider() string
+
+	// Poll returns every session the agent currently considers live, and
+	// when that state was read. The observation time is the agent's, not the
+	// relay's: it orders a slow poll against a fast hook describing the same
+	// session.
+	//
+	// An empty slice with no error is a valid answer and means the agent has
+	// nothing live. It is NOT the same as an error, which means the agent
+	// could not be asked and the relay must leave its state alone.
+	Poll(ctx context.Context) (sessions []stoplight.Report, observedAt time.Time, err error)
 }
 
 // registry holds every adapter compiled into the binary.
