@@ -278,8 +278,25 @@ func (t *Tracker) Reconcile(sync Sync, now time.Time) (changed bool) {
 	for id, session := range t.sessions {
 		switch {
 		case declared[id]:
-		case session.Provider != provider:
-			// Another producer's session, or one that never named a provider.
+		case session.Provider != "" && session.Provider != provider:
+			// Another producer's session. Only a named, DIFFERENT provider is
+			// protected: a sync speaks for itself and must not delete work it
+			// knows nothing about.
+			//
+			// An UNATTRIBUTED session is not protected, and used to be. The
+			// reasoning was that a session which never named a producer could
+			// not honestly be claimed by one, which sounds careful and leaks
+			// without bound: the Claude Code hooks did not send a provider, so
+			// every session they created was unattributable and no sync could
+			// ever reap it. Pre-warmed workers that fire one event and are
+			// never dispatched accumulated forever, and one of them holding a
+			// red state kept the lamp red while every real session was fine.
+			//
+			// An unattributed session has no other claimant by definition, so
+			// the producer that is syncing is the best claim available. Being
+			// wrong costs one session removed early, and it will be recreated
+			// by its next report. Being wrong the other way costs a lamp that
+			// is permanently, unfixably red.
 		case session.observedAt.After(sync.ObservedAt):
 			// Observed more recently than this sync was taken, so this sync
 			// cannot speak to whether it exists.

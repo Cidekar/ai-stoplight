@@ -176,6 +176,23 @@ func TestResolveAgentSkipsNonExecutables(t *testing.T) {
 	}
 }
 
+// The hooks must identify their provider. Without it every session they
+// created was unattributable, and an unattributed session could not be
+// reconciled by anyone: pre-warmed workers that fire one event and are never
+// dispatched piled up forever, and one holding a red state kept the lamp red
+// while every real session was fine.
+//
+// The provider is also what scopes a sync, so the hooks and the poll have to
+// agree on the string or the poll would decline to reap what the hooks made.
+func TestHookCommandSendsTheProvider(t *testing.T) {
+	for _, event := range []string{"idle", "started", "blocked", "finished", "ended"} {
+		cmd := hookCommand("/usr/local/bin/stoplight", event)
+		if !strings.Contains(cmd, "--provider "+ProviderName) {
+			t.Errorf("hookCommand(%q) does not pass --provider %s: %q", event, ProviderName, cmd)
+		}
+	}
+}
+
 // An untitled session reports its own ID as its name, and a hex ID is the
 // worst thing a seven-character screen can show. Reporting it as a label would
 // also freeze it: RFC 1 section 9 never recomputes a label a producer sent, so

@@ -127,7 +127,8 @@ func TestHookCommandExtractsSessionID(t *testing.T) {
 	if err != nil {
 		t.Fatalf("the stub was never called: %v", err)
 	}
-	want := "notify\nblocked\n--session-id\nabc123\n--cwd\n/Users/me/projects/auth-api\n"
+	want := "notify\nblocked\n--session-id\nabc123\n--cwd\n" +
+		"/Users/me/projects/auth-api\n--provider\n" + ProviderName + "\n"
 	if string(got) != want {
 		t.Errorf("arguments =\n%q\nwant\n%q", got, want)
 	}
