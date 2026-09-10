@@ -93,16 +93,51 @@ func TestReconcileLeavesOtherProvidersAlone(t *testing.T) {
 	}
 }
 
-// A session that named no provider arrived before anyone identified
-// themselves, so no sync can honestly claim to speak for it.
-func TestReconcileLeavesProviderlessSessionsAlone(t *testing.T) {
+// An unattributed session IS reaped by a sync, and protecting it was a real
+// leak. The Claude Code hooks sent no provider, so every session they created
+// was unattributable and no sync could ever remove it: pre-warmed workers that
+// fire one event and are never dispatched piled up, and one of them holding a
+// red state kept the lamp red while every real session was fine.
+//
+// An unattributed session has no other claimant by definition, so the syncing
+// producer is the best claim available. Removing it early costs one session
+// that its next report recreates. The other way costs an unfixable red.
+func TestReconcileReapsUnattributedSessions(t *testing.T) {
 	tracker := NewTracker(testTimeout)
 	tracker.Apply(report("anon", "blocked"), base) // no provider
 
+	if got := tracker.Aggregate(); got != ColorRed {
+		t.Fatalf("Aggregate() = %v, want red", got)
+	}
+
 	tracker.Reconcile(syncOf("claude-code", time.Minute), base.Add(time.Minute))
 
-	if got := len(tracker.Sessions()); got != 1 {
-		t.Errorf("len(Sessions()) = %d, want 1: a providerless session is not ours to remove", got)
+	if got := len(tracker.Sessions()); got != 0 {
+		t.Errorf("len(Sessions()) = %d, want 0: an unattributed session has no other claimant", got)
+	}
+	if got := tracker.Aggregate(); got != ColorOff {
+		t.Errorf("Aggregate() = %v, want off: the stuck red must clear", got)
+	}
+}
+
+// But a session belonging to a NAMED, different provider is still protected.
+// Two producers syncing on their own schedules must not delete each other.
+func TestReconcileStillProtectsANamedOtherProvider(t *testing.T) {
+	tracker := NewTracker(testTimeout)
+	tracker.Apply(withProvider(report("theirs", "blocked"), "deepseek"), base)
+	tracker.Apply(report("anon", "started"), base) // unattributed
+
+	tracker.Reconcile(syncOf("claude-code", time.Minute), base.Add(time.Minute))
+
+	sessions := tracker.Sessions()
+	if len(sessions) != 1 {
+		t.Fatalf("len(Sessions()) = %d, want 1", len(sessions))
+	}
+	if sessions[0].ID != "theirs" {
+		t.Errorf("surviving session = %q, want theirs", sessions[0].ID)
+	}
+	if got := tracker.Aggregate(); got != ColorRed {
+		t.Errorf("Aggregate() = %v, want red: another provider's red must survive", got)
 	}
 }
 

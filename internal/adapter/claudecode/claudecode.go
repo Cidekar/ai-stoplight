@@ -119,8 +119,9 @@ func hookCommand(binPath, event string) string {
 			`payload=$(cat); `+
 			`sid=$(printf '%%s' "$payload" | sed -n 's/.*"session_id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p'); `+
 			`dir=$(printf '%%s' "$payload" | sed -n 's/.*"cwd"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p'); `+
-			`%s notify %s --session-id "${sid:-$PPID}" --cwd "${dir:-$PWD}" >/dev/null 2>&1 || true`,
-		marker, shellQuote(binPath), event,
+			`%s notify %s --session-id "${sid:-$PPID}" --cwd "${dir:-$PWD}" `+
+			`--provider %s >/dev/null 2>&1 || true`,
+		marker, shellQuote(binPath), event, ProviderName,
 	)
 }
 
