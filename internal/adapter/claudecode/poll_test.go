@@ -89,6 +89,93 @@ func TestProviderMatchesTheHooks(t *testing.T) {
 	}
 }
 
+// The relay runs as a service, and a service does not inherit the PATH of the
+// shell that installed it. Claude Code lives in ~/.local/bin, which is on an
+// interactive PATH and absent from launchd's, so the poll failed with
+// "executable file not found in $PATH" on a machine where typing `claude`
+// worked. Resolution must not depend on how the relay was started.
+func TestResolveAgentFindsABinaryOutsidePath(t *testing.T) {
+	dir := t.TempDir()
+	name := "fake-agent-binary"
+	path := filepath.Join(dir, name)
+	if err := os.WriteFile(path, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatalf("write fake binary: %v", err)
+	}
+
+	// An empty PATH is the worst case a service can hand us.
+	t.Setenv("PATH", "")
+
+	restore := searchPaths
+	t.Cleanup(func() { searchPaths = restore })
+	searchPaths = []string{dir}
+
+	if got := resolveAgent(name); got != path {
+		t.Errorf("resolveAgent(%q) = %q, want %q", name, got, path)
+	}
+}
+
+// PATH still wins when it resolves, so a user with a deliberate override is
+// not second-guessed by the fallback list.
+func TestResolveAgentPrefersPath(t *testing.T) {
+	onPath := t.TempDir()
+	fallback := t.TempDir()
+	name := "fake-agent-pref"
+
+	for _, dir := range []string{onPath, fallback} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+			t.Fatalf("write fake binary: %v", err)
+		}
+	}
+
+	t.Setenv("PATH", onPath)
+	restore := searchPaths
+	t.Cleanup(func() { searchPaths = restore })
+	searchPaths = []string{fallback}
+
+	if got := resolveAgent(name); got != filepath.Join(onPath, name) {
+		t.Errorf("resolveAgent(%q) = %q, want the PATH copy in %q", name, got, onPath)
+	}
+}
+
+// Nothing found returns the bare name, so exec reports the failure with its
+// own message rather than this function inventing a path that does not exist.
+func TestResolveAgentFallsBackToTheBareName(t *testing.T) {
+	t.Setenv("PATH", "")
+	restore := searchPaths
+	t.Cleanup(func() { searchPaths = restore })
+	searchPaths = []string{t.TempDir()}
+
+	if got := resolveAgent("definitely-not-installed"); got != "definitely-not-installed" {
+		t.Errorf("resolveAgent() = %q, want the name unchanged", got)
+	}
+}
+
+// A directory that happens to share the binary's name is not the binary, and
+// neither is a file nobody can execute.
+func TestResolveAgentSkipsNonExecutables(t *testing.T) {
+	dir := t.TempDir()
+	name := "fake-agent-skip"
+
+	// A directory with the right name.
+	if err := os.Mkdir(filepath.Join(dir, name), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	// And a non-executable file, in a later directory.
+	second := t.TempDir()
+	if err := os.WriteFile(filepath.Join(second, name), []byte("data"), 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	t.Setenv("PATH", "")
+	restore := searchPaths
+	t.Cleanup(func() { searchPaths = restore })
+	searchPaths = []string{dir, second}
+
+	if got := resolveAgent(name); got != name {
+		t.Errorf("resolveAgent() = %q, want the bare name: neither candidate is runnable", got)
+	}
+}
+
 // A poll that cannot run is an error, not an empty answer. RFC 1 section 5.4
 // makes the difference load-bearing: empty means remove everything, and no
 // answer means leave it alone. Conflating them clears the whole light every

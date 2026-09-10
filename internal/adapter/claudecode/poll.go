@@ -4,7 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"time"
 
 	"github.com/cidekar/stoplight/internal/stoplight"
@@ -25,6 +27,46 @@ const ProviderName = "claude-code"
 // a stable interface. A light that breaks on a Claude Code point release is
 // worse than a light that cannot name a spare.
 var pollCommand = []string{"claude", "agents", "--json"}
+
+// searchPaths are checked for the agent binary when PATH does not resolve it,
+// in order of preference.
+//
+// The relay normally runs as a launchd or systemd service, and a service does
+// not inherit the PATH of the shell that installed it. Claude Code installs to
+// ~/.local/bin, which is on an interactive PATH and absent from a service's:
+// the poll failed with "executable file not found in $PATH" for exactly this
+// reason, on a machine where typing `claude` worked perfectly.
+//
+// Depending on the service manager's PATH would make polling work or not by
+// accident of how the relay was started, which is not a property a light
+// should have. Resolving the binary here makes it the same either way.
+var searchPaths = []string{
+	"$HOME/.local/bin",
+	"/opt/homebrew/bin",
+	"/usr/local/bin",
+	"/usr/bin",
+}
+
+// resolveAgent returns a path to the agent binary, preferring PATH and falling
+// back to the known install locations.
+//
+// It returns the bare name unchanged when nothing is found, so the failure is
+// reported by exec with its own message rather than by a guess made here.
+func resolveAgent(name string) string {
+	if filepath.IsAbs(name) {
+		return name
+	}
+	if found, err := exec.LookPath(name); err == nil {
+		return found
+	}
+	for _, dir := range searchPaths {
+		candidate := filepath.Join(os.ExpandEnv(dir), name)
+		if info, err := os.Stat(candidate); err == nil && !info.IsDir() && info.Mode()&0o111 != 0 {
+			return candidate
+		}
+	}
+	return name
+}
 
 // pollTimeout bounds one query. Querying an agent is slower than a hook by
 // orders of magnitude, and the relay's ticker must not stack up behind a
@@ -61,7 +103,7 @@ func (a *Adapter) Poll(ctx context.Context) ([]stoplight.Report, time.Time, erro
 	ctx, cancel := context.WithTimeout(ctx, pollTimeout)
 	defer cancel()
 
-	out, err := exec.CommandContext(ctx, pollCommand[0], pollCommand[1:]...).Output()
+	out, err := exec.CommandContext(ctx, resolveAgent(pollCommand[0]), pollCommand[1:]...).Output()
 	if err != nil {
 		return nil, time.Time{}, fmt.Errorf("%s: %w", pollCommand[0], err)
 	}
