@@ -176,6 +176,90 @@ func TestResolveAgentSkipsNonExecutables(t *testing.T) {
 	}
 }
 
+// An untitled session reports its own ID as its name, and a hex ID is the
+// worst thing a seven-character screen can show. Reporting it as a label would
+// also freeze it: RFC 1 section 9 never recomputes a label a producer sent, so
+// the session could not pick up a better one later.
+//
+// The cases are taken from a real desk. 339d206f was blocked and waiting for
+// input while showing "339d206f", when its worktree was called
+// chore+vitest-align-3-2-7.
+func TestSessionLabelDropsAnUntitledName(t *testing.T) {
+	tests := []struct {
+		name  string
+		entry agentEntry
+		want  string
+	}{
+		{
+			name:  "a titled session keeps its name",
+			entry: agentEntry{SessionID: "c37f76a7-9fae-4255-9fc0-5af63f485628", Name: "project state review"},
+			want:  "project state review",
+		},
+		{
+			name:  "a name equal to the short ID is not a name",
+			entry: agentEntry{SessionID: "339d206f-635c-4d6b-98e1-2d3726537cd2", Name: "339d206f"},
+			want:  "",
+		},
+		{
+			name:  "a name equal to the full ID is not a name",
+			entry: agentEntry{SessionID: "2026a22b-2c7e-44bb-a622-139fed94f1ed", Name: "2026a22b-2c7e-44bb-a622-139fed94f1ed"},
+			want:  "",
+		},
+		{
+			name:  "an empty name is nothing to show",
+			entry: agentEntry{SessionID: "e3f7acef-2bfc-4abe-a667-2496b6102416", Name: ""},
+			want:  "",
+		},
+		{
+			name:  "a name that merely starts like the ID is still a name",
+			entry: agentEntry{SessionID: "339d206f-635c-4d6b-98e1-2d3726537cd2", Name: "339d206f rebase"},
+			want:  "339d206f rebase",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := sessionLabel(tc.entry); got != tc.want {
+				t.Errorf("sessionLabel() = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// End to end: an untitled entry reaches the relay with no label but with its
+// cwd, which is what lets derivation name it.
+func TestPollLeavesUntitledSessionsForDerivation(t *testing.T) {
+	restore := pollCommand
+	t.Cleanup(func() { pollCommand = restore })
+
+	pollCommand = fakeCommand(t, `[
+	  {"sessionId":"339d206f-635c-4d6b-98e1-2d3726537cd2","cwd":"/repo/.claude/worktrees/chore+vitest-align-3-2-7","name":"339d206f","state":"blocked"},
+	  {"sessionId":"c37f76a7-9fae-4255-9fc0-5af63f485628","cwd":"/repo","name":"project state review","state":"working"}
+	]`)
+
+	sessions, _, err := New().Poll(context.Background())
+	if err != nil {
+		t.Fatalf("Poll() error = %v", err)
+	}
+
+	byID := map[string]string{}
+	cwdByID := map[string]string{}
+	for _, s := range sessions {
+		byID[s.SessionID] = s.Label
+		cwdByID[s.SessionID] = s.Cwd
+	}
+
+	if got := byID["339d206f-635c-4d6b-98e1-2d3726537cd2"]; got != "" {
+		t.Errorf("untitled session label = %q, want empty so the relay derives it", got)
+	}
+	if got := cwdByID["339d206f-635c-4d6b-98e1-2d3726537cd2"]; got == "" {
+		t.Error("untitled session cwd is empty: derivation has nothing to work from")
+	}
+	if got := byID["c37f76a7-9fae-4255-9fc0-5af63f485628"]; got != "project state review" {
+		t.Errorf("titled session label = %q, want it preserved", got)
+	}
+}
+
 // A poll that cannot run is an error, not an empty answer. RFC 1 section 5.4
 // makes the difference load-bearing: empty means remove everything, and no
 // answer means leave it alone. Conflating them clears the whole light every

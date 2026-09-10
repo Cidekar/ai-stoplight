@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/cidekar/stoplight/internal/stoplight"
@@ -131,12 +132,47 @@ func (a *Adapter) Poll(ctx context.Context) ([]stoplight.Report, time.Time, erro
 		reports = append(reports, stoplight.Report{
 			SessionID: entry.SessionID,
 			Event:     event,
-			Label:     entry.Name,
+			Label:     sessionLabel(entry),
 			Cwd:       entry.Cwd,
 			Provider:  ProviderName,
 		})
 	}
 	return reports, observedAt, nil
+}
+
+// sessionLabel returns the label to report for a polled session, or the empty
+// string to let the relay derive one.
+//
+// Claude Code titles a session from what it is doing, which is far better than
+// anything derivable: "translation service changes review" beats the directory
+// name every time. But an untitled session reports its own ID as the name, and
+// a hex ID is the worst thing a seven-character screen can show. Worse, the
+// relay never recomputes a label a producer SENT, per RFC 1 section 9, so
+// passing the ID through freezes it: the session can never pick up a better
+// label even once its cwd is known.
+//
+// Returning empty instead hands the decision to DeriveLabel, which reads the
+// git branch and then the directory. A blocked session showing
+// "chore+vitest-align" can be identified; one showing "339d206f" cannot, and
+// identifying the session that wants you is the entire job of the screen.
+func sessionLabel(entry agentEntry) string {
+	if isUntitled(entry) {
+		return ""
+	}
+	return entry.Name
+}
+
+// isUntitled reports whether a name is really just the session ID wearing a
+// name's clothes.
+//
+// Both forms are checked because the command uses the short ID for a display
+// name and the full UUID elsewhere, and either would reach the glass as hex.
+func isUntitled(entry agentEntry) bool {
+	if entry.Name == "" || entry.Name == entry.SessionID {
+		return true
+	}
+	short, _, found := strings.Cut(entry.SessionID, "-")
+	return found && entry.Name == short
 }
 
 // eventForState maps a Claude Code session state onto an RFC 1 event.
