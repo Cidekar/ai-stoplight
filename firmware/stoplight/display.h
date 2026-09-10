@@ -191,6 +191,12 @@ class Display {
   void reassertPanel(uint32_t now);
   void resetScroll(uint32_t now);
   void clampIndex();
+  // isRed, countRed and nextIndex confine rotation to the red sessions while
+  // any session is red, so a session that needs a human cannot scroll away
+  // before it is dealt with. See the comment at the canRotate test in tick().
+  bool isRed(uint8_t i) const;
+  uint8_t countRed() const;
+  uint8_t nextIndex(uint8_t redCount) const;
   int findById(const char* id) const;
   int16_t scrollOffset(uint32_t now, int16_t overflowPx, bool* finished) const;
   bool labelOverflows(const Slot& sl, int16_t* overflowPx) const;
