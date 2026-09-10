@@ -1223,16 +1223,40 @@ void testRolloverSafety() {
     // Past the deadline the hold releases, so the flag holds the screen
     // without wedging it for the remaining 49 days.
     d.tick(atWrap + (uint32_t)DISP_ROTATE_MIN_MS);
-    check(!d.holdingRed(), "the hold released once its interval had passed");
-    checkStr(d.currentLabel(), "one", "and rotation resumed");
+    // Past the deadline the interval hold releases, but the screen STAYS on
+    // the red session: rotation is confined to the reds while any session is
+    // red, and here there is exactly one. The lamp says something needs a
+    // human and the screen has to keep saying which.
+    d.tick(atWrap + (uint32_t)DISP_ROTATE_MIN_MS);
+    checkStr(d.currentLabel(), "two",
+             "the red session keeps the screen past the interval");
 
-    // And it keeps cycling afterwards.
-    for (uint32_t t = (uint32_t)DISP_ROTATE_MIN_MS + 100u; t <= 7000u;
+    // Still there much later. A red session does not scroll away on a timer.
+    for (uint32_t t = (uint32_t)DISP_ROTATE_MIN_MS + 100u; t <= 30000u;
          t += 100u) {
       d.tick(atWrap + t);
     }
     checkStr(d.currentLabel(), "two",
-             "rotation carried on normally after the hold expired");
+             "and it is still there thirty seconds later");
+
+    // Once it is no longer red, normal rotation resumes across the wrap.
+    Frame h;
+    check(parseFrame("{\"color\":\"green\",\"sessions\":[{\"id\":\"a1\","
+                     "\"label\":\"one\",\"state\":\"working\","
+                     "\"color\":\"green\"},{\"id\":\"b2\",\"label\":\"two\","
+                     "\"state\":\"done\",\"color\":\"green\"}]}",
+                     &h),
+          "the resolved frame parses");
+    d.applyFrame(h, atWrap + 31000u);
+    bool moved = false;
+    for (uint32_t t = 31000u; t <= 60000u; t += 100u) {
+      d.tick(atWrap + t);
+      if (strcmp(d.currentLabel(), "one") == 0) {
+        moved = true;
+        break;
+      }
+    }
+    check(moved, "rotation resumed once nothing was red any more");
   }
 
   // The same at a non-wrapping instant, so the flag is not merely correct at
@@ -1259,7 +1283,8 @@ void testRolloverSafety() {
     checkInt((long)d.holdDeadline(), 5000 + DISP_ROTATE_MIN_MS,
              "and its deadline is the plain sum");
     d.tick(5000 + DISP_ROTATE_MIN_MS);
-    check(!d.holdingRed(), "and it releases on time");
+    checkStr(d.currentLabel(), "two",
+             "and the red session still holds the screen away from the wrap");
   }
 
   // A manual advance overrides the hold rather than waiting it out: the user
@@ -1737,6 +1762,160 @@ void testDisplayBehaviour() {
     checkStr(slTestScreen.header, "*", "the pin marker is drawn when pinned");
     checkInt(slTestScreen.dotX[0], unpinnedFirstX,
              "the dots do not shift when the pin marker appears");
+  }
+
+  // ---------------------------------------------------------------------
+  // Rotation is confined to the red sessions while anything is red.
+  //
+  // The lamp says something needs a human. The screen has to say WHICH, and
+  // a red session that scrolled away on a three-second timer made the screen
+  // useless for its one job at the moment it mattered most.
+  // ---------------------------------------------------------------------
+
+  // One red among several: the screen holds it and does not wander off.
+  {
+    Display d;
+    Frame f;
+    check(parseFrame("{\"color\":\"red\",\"sessions\":["
+                     "{\"id\":\"a1\",\"label\":\"green-one\","
+                     "\"state\":\"done\",\"color\":\"green\"},"
+                     "{\"id\":\"b2\",\"label\":\"the-red\","
+                     "\"state\":\"needs you\",\"color\":\"red\"},"
+                     "{\"id\":\"c3\",\"label\":\"yellow-one\","
+                     "\"state\":\"working\",\"color\":\"yellow\"}]}",
+                     &f),
+          "the one-red frame parses");
+    d.applyFrame(f, 1000);
+    checkStr(d.currentLabel(), "the-red", "the screen jumped to the red one");
+
+    // Tick for a minute. Nothing may take the screen off it.
+    bool strayed = false;
+    for (uint32_t t = 1100u; t <= 61000u; t += 100u) {
+      d.tick(t);
+      if (strcmp(d.currentLabel(), "the-red") != 0) {
+        strayed = true;
+        break;
+      }
+    }
+    check(!strayed, "a red session never scrolls away while it is red");
+  }
+
+  // THE CASE A PLAIN HOLD GETS WRONG. Two red sessions must both be named:
+  // holding the first would mean the second is never seen, so the human deals
+  // with one problem and does not learn there are two.
+  {
+    Display d;
+    Frame f;
+    check(parseFrame("{\"color\":\"red\",\"sessions\":["
+                     "{\"id\":\"a1\",\"label\":\"red-one\","
+                     "\"state\":\"needs you\",\"color\":\"red\"},"
+                     "{\"id\":\"b2\",\"label\":\"green-mid\","
+                     "\"state\":\"done\",\"color\":\"green\"},"
+                     "{\"id\":\"c3\",\"label\":\"red-two\","
+                     "\"state\":\"needs you\",\"color\":\"red\"}]}",
+                     &f),
+          "the two-red frame parses");
+    d.applyFrame(f, 1000);
+
+    bool sawOne = false, sawTwo = false, sawGreen = false;
+    for (uint32_t t = 1100u; t <= 61000u; t += 100u) {
+      d.tick(t);
+      const char* label = d.currentLabel();
+      if (strcmp(label, "red-one") == 0) sawOne = true;
+      if (strcmp(label, "red-two") == 0) sawTwo = true;
+      if (strcmp(label, "green-mid") == 0) sawGreen = true;
+    }
+    check(sawOne, "the first red session was shown");
+    check(sawTwo, "the second red session was shown too, not starved");
+    check(!sawGreen,
+          "and the green session between them was skipped while reds waited");
+  }
+
+  // Once nothing is red, full rotation comes back.
+  {
+    Display d;
+    Frame f;
+    check(parseFrame("{\"color\":\"red\",\"sessions\":["
+                     "{\"id\":\"a1\",\"label\":\"was-red\","
+                     "\"state\":\"needs you\",\"color\":\"red\"},"
+                     "{\"id\":\"b2\",\"label\":\"other\","
+                     "\"state\":\"working\",\"color\":\"yellow\"}]}",
+                     &f),
+          "the red frame parses");
+    d.applyFrame(f, 1000);
+    for (uint32_t t = 1100u; t <= 20000u; t += 100u) d.tick(t);
+    checkStr(d.currentLabel(), "was-red", "the red session held");
+
+    Frame g;
+    check(parseFrame("{\"color\":\"yellow\",\"sessions\":["
+                     "{\"id\":\"a1\",\"label\":\"was-red\","
+                     "\"state\":\"working\",\"color\":\"yellow\"},"
+                     "{\"id\":\"b2\",\"label\":\"other\","
+                     "\"state\":\"working\",\"color\":\"yellow\"}]}",
+                     &g),
+          "the resolved frame parses");
+    d.applyFrame(g, 20100);
+
+    bool rotated = false;
+    for (uint32_t t = 20200u; t <= 40000u; t += 100u) {
+      d.tick(t);
+      if (strcmp(d.currentLabel(), "other") == 0) {
+        rotated = true;
+        break;
+      }
+    }
+    check(rotated, "rotation resumed once the red was resolved");
+  }
+
+  // The pin still wins. A pin is a deliberate instruction to watch one
+  // session, and the lamp is red regardless, so the alert is not lost.
+  {
+    Display d;
+    Frame f;
+    check(parseFrame("{\"color\":\"red\",\"sessions\":["
+                     "{\"id\":\"a1\",\"label\":\"pinned-green\","
+                     "\"state\":\"done\",\"color\":\"green\"},"
+                     "{\"id\":\"b2\",\"label\":\"the-red\","
+                     "\"state\":\"needs you\",\"color\":\"red\"}]}",
+                     &f),
+          "the frame parses");
+
+    // Pin the green session BEFORE the red arrives, by applying an all-green
+    // frame first so the jump does not move the index.
+    Frame green;
+    check(parseFrame("{\"color\":\"green\",\"sessions\":["
+                     "{\"id\":\"a1\",\"label\":\"pinned-green\","
+                     "\"state\":\"done\",\"color\":\"green\"},"
+                     "{\"id\":\"b2\",\"label\":\"other\","
+                     "\"state\":\"done\",\"color\":\"green\"}]}",
+                     &green),
+          "the all-green frame parses");
+    d.applyFrame(green, 1000);
+    d.togglePin(1000);
+    check(d.isPinned(), "the green session is pinned");
+
+    d.applyFrame(f, 2000);
+    for (uint32_t t = 2100u; t <= 30000u; t += 100u) d.tick(t);
+    checkStr(d.currentLabel(), "pinned-green",
+             "the pin held even though another session was red");
+  }
+
+  // A single session that is red must not thrash its own scroll. Advancing to
+  // the slot you are already on would restart the marquee every interval,
+  // and a label that keeps jumping back is harder to read than one that
+  // holds.
+  {
+    Display d;
+    Frame f;
+    check(parseFrame("{\"color\":\"red\",\"sessions\":[{\"id\":\"a1\","
+                     "\"label\":\"a-very-long-label-that-scrolls\","
+                     "\"state\":\"needs you\",\"color\":\"red\"}]}",
+                     &f),
+          "the single red frame parses");
+    d.applyFrame(f, 1000);
+    for (uint32_t t = 1100u; t <= 30000u; t += 100u) d.tick(t);
+    checkStr(d.currentLabel(), "a-very-long-label-that-scrolls",
+             "a single red session is still the one on screen");
   }
 }
 

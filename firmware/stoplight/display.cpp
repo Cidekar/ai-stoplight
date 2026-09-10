@@ -368,7 +368,16 @@ void Display::tick(uint32_t now) {
   // A single session does not rotate: a cycle of one is a static screen
   // redrawing for no reason. Its label still scrolls, so the marquee is
   // restarted here rather than advancing to a next slot that does not exist.
-  bool canRotate = (count_ > 1) && !pinned_;
+  // While anything is red the screen stays among the red sessions. The lamp
+  // says something needs a human; the screen has to say WHICH, and a session
+  // that scrolled away while still red made the screen useless for the one
+  // job it exists to do at the moment it mattered most.
+  //
+  // Rotating among the reds rather than holding the first one is what keeps
+  // two blocked sessions from hiding each other: a hold would pin the screen
+  // to whichever went red first, and the second would never be named.
+  uint8_t redCount = countRed();
+  bool canRotate = (count_ > 1) && !pinned_ && (redCount != 1 || !isRed(index_));
 
   bool minElapsed = (uint32_t)(now - slotEnteredAt_) >= DISP_ROTATE_MIN_MS;
 
@@ -378,7 +387,7 @@ void Display::tick(uint32_t now) {
     // Both conditions met: the minimum interval has passed AND the label has
     // finished scrolling. This is the whole of "rotation waits for
     // scrolling".
-    index_ = (uint8_t)((index_ + 1) % count_);
+    index_ = nextIndex(redCount);
     slotEnteredAt_ = now;
     holding_ = false;
     resetScroll(now);
@@ -400,6 +409,37 @@ void Display::tick(uint32_t now) {
       count_ != lastDrawnCount_ || pinned_ != lastDrawnPinned_) {
     render(now);
   }
+}
+
+bool Display::isRed(uint8_t i) const {
+  return i < count_ && slots_[i].s.color == COLOR_RED;
+}
+
+uint8_t Display::countRed() const {
+  uint8_t n = 0;
+  for (uint8_t i = 0; i < count_; i++) {
+    if (slots_[i].s.color == COLOR_RED) n++;
+  }
+  return n;
+}
+
+// nextIndex picks the slot to advance to. With any session red it returns the
+// next red one, wrapping, so rotation is confined to what needs a human.
+//
+// The search starts at index_ + 1 and runs a full lap, which makes the single
+// red case return index_ itself. That is correct and is why tick() also
+// refuses to rotate in that case: advancing to the slot you are already on
+// would restart the scroll every interval, and a label that keeps jumping
+// back to its start is harder to read than one that holds.
+uint8_t Display::nextIndex(uint8_t redCount) const {
+  if (redCount == 0) {
+    return (uint8_t)((index_ + 1) % count_);
+  }
+  for (uint8_t step = 1; step <= count_; step++) {
+    uint8_t candidate = (uint8_t)((index_ + step) % count_);
+    if (slots_[candidate].s.color == COLOR_RED) return candidate;
+  }
+  return index_;
 }
 
 void Display::render(uint32_t now) {
