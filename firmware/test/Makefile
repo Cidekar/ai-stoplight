@@ -31,7 +31,11 @@ BIN       := $(BUILD_DIR)/test_stoplight
 # the constructor that looks exactly like a real firmware bug. That cost a
 # diagnosis during the blank-screen investigation. The compiler already knows
 # the true dependencies, so let it record them.
-CXXFLAGS := -std=c++17 -g -O1 \
+# SL_HOST_TEST compiles blelink.cpp without the ESP32 BLE library, which does
+# not exist on a host. The queue, the drop rule and the reassembly are plain
+# C++ and are tested; the radio itself is not, and cannot be. See the gap
+# table in firmware/readme.md.
+CXXFLAGS := -std=c++17 -g -O1 -DSL_HOST_TEST \
             -I$(STUB_DIR) -I$(SRC_DIR) \
             -Wall -Wextra -Wconversion -Wshadow \
             -fsanitize=address,undefined \
@@ -50,7 +54,8 @@ SOURCES := test_main.cpp \
            $(SRC_DIR)/protocol.cpp \
            $(SRC_DIR)/display.cpp \
            $(SRC_DIR)/lamps.cpp \
-           $(SRC_DIR)/button.cpp
+           $(SRC_DIR)/button.cpp \
+           $(SRC_DIR)/blelink.cpp
 
 OBJECTS := $(addprefix $(BUILD_DIR)/,$(notdir $(SOURCES:.cpp=.o)))
 

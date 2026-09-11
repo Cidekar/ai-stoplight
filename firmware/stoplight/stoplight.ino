@@ -24,6 +24,7 @@
 #include <Arduino.h>
 #include <Wire.h>
 
+#include "blelink.h"
 #include "button.h"
 #include "display.h"
 #include "lamps.h"
@@ -43,6 +44,20 @@
 Lamps lamps;
 Display display;
 Button button;
+BleLink ble;
+
+// ONE reader for BOTH transports, which is the point.
+//
+// A BLE chunk is indistinguishable from a partial serial read: both are a
+// slice of bytes at an arbitrary offset, and the '\n' in the payload is the
+// only frame delimiter either one has. Feeding both into the same LineReader
+// is what makes that true in code rather than only in the contract. Two
+// readers would be two chances to disagree about the frame format, and the
+// BLE one would be the one nobody watches.
+//
+// It also means a frame may arrive half over USB and half over the radio.
+// That is nonsense in practice, but it is harmless: the bytes concatenate,
+// the line either parses or it does not, and a corrupt line costs one update.
 LineReader reader;
 
 // One reusable Frame. Parsing into a static buffer avoids putting a ~1KB
@@ -80,52 +95,86 @@ void setup() {
   display.begin();
   button.begin();
 
+  // The radio starts unconditionally, alongside serial rather than instead
+  // of it. Which link the relay uses is the relay's choice, and a light that
+  // answered only one of them would need a build flag to switch, which is a
+  // decision made at flash time about something discovered at run time.
+  ble.begin();
+
   lastFrameAt = millis();
+}
+
+// feedByte hands one byte to the reader and acts on a completed line. It is
+// the whole of frame handling, and it is transport-agnostic on purpose: the
+// serial drain and the BLE drain both call it, so neither link can develop
+// its own idea of what a frame is.
+//
+// Returns true when the byte produced something worth counting as activity,
+// which is a complete frame or a salvaged aggregate.
+static bool feedByte(char c, uint32_t now) {
+  if (!reader.feed(c)) {
+    // An oversized line yields no frame, but it may still have given up its
+    // aggregate. Move the lamps on it and leave the screen alone: the
+    // session list was unusable, and a stale label beats a wrong one.
+    // Losing the labels is acceptable; losing the lamp is not.
+    Color salvaged;
+    if (reader.overflowColor(&salvaged)) {
+      lamps.set(salvaged);
+      return true;
+    }
+    return false;
+  }
+
+  // A complete line. Parse it, and ignore it if it was not usable.
+  if (!parseFrame(reader.line(), &frame)) {
+    return false;
+  }
+
+  // THE LAMPS. Straight from the frame's aggregate, with no reference to
+  // the display, the rotation index, or the pin.
+  //
+  // A frame with no "color" key leaves the lamps where they are, because
+  // absent means "no instruction", not "off".
+  if (frame.hasColor) {
+    lamps.set(frame.color);
+  }
+
+  // THE SCREEN. Separately, and it cannot reach back to the lamps.
+  display.applyFrame(frame, now);
+
+  return true;
 }
 
 void loop() {
   const uint32_t now = millis();
 
-  // 1. Drain whatever serial has for us. Bounded per iteration so that a
-  // fast writer cannot starve the button and the display: the reader keeps
-  // its partial line between iterations, so stopping early is free.
+  // 1. Drain both transports. Bounded per iteration so that a fast writer
+  // cannot starve the button and the display: the reader keeps its partial
+  // line between iterations, so stopping early is free.
+  //
+  // The two drains share a budget rather than having one each, so a busy
+  // radio and a busy cable together still cannot hold the loop for longer
+  // than one link could alone.
   uint16_t budget = 256;
+
   while (Serial.available() > 0 && budget-- > 0) {
     int c = Serial.read();
     if (c < 0) {
       break;
     }
-    if (!reader.feed((char)c)) {
-      // An oversized line yields no frame, but it may still have given up
-      // its aggregate. Move the lamps on it and leave the screen alone: the
-      // session list was unusable, and a stale label beats a wrong one.
-      // Losing the labels is acceptable; losing the lamp is not.
-      Color salvaged;
-      if (reader.overflowColor(&salvaged)) {
-        lamps.set(salvaged);
-        lastFrameAt = now;
-      }
-      continue;
+    if (feedByte((char)c, now)) {
+      lastFrameAt = now;
     }
+  }
 
-    // A complete line. Parse it, and ignore it if it was not usable.
-    if (!parseFrame(reader.line(), &frame)) {
-      continue;
+  while (ble.available() > 0 && budget-- > 0) {
+    int c = ble.read();
+    if (c < 0) {
+      break;
     }
-
-    // THE LAMPS. Straight from the frame's aggregate, with no reference to
-    // the display, the rotation index, or the pin.
-    //
-    // A frame with no "color" key leaves the lamps where they are, because
-    // absent means "no instruction", not "off".
-    if (frame.hasColor) {
-      lamps.set(frame.color);
+    if (feedByte((char)c, now)) {
+      lastFrameAt = now;
     }
-
-    // THE SCREEN. Separately, and it cannot reach back to the lamps.
-    display.applyFrame(frame, now);
-
-    lastFrameAt = now;
   }
 
   // 2. The button.

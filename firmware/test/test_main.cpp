@@ -25,6 +25,7 @@
 
 #include "Arduino.h"
 #include "U8g2lib.h"
+#include "blelink.h"
 #include "button.h"
 #include "display.h"
 #include "lamps.h"
@@ -2147,6 +2148,312 @@ void testButton() {
 
 }  // namespace
 
+// ---------------------------------------------------------------------------
+// The BLE link: the byte queue, the drop rule, and reassembly through the
+// SAME LineReader the serial path uses.
+//
+// What these checks cannot reach is the radio itself. BleLink::begin() is a
+// no-op on a host, so nothing here proves the service is advertised, the UUID
+// is right, or the MTU is negotiated. That gap is the same shape as the panel
+// offset: a passing suite says nothing about it. See firmware/readme.md.
+// ---------------------------------------------------------------------------
+void testBleLink() {
+  section("BLE link");
+
+  // A chunk boundary is a byte offset and nothing else. It may fall inside a
+  // string, inside a number, or between the last '}' and the '\n'. The
+  // contract says so explicitly, and this walks EVERY boundary of a real
+  // frame to prove no particular one is special.
+  {
+    const char* json =
+        "{\"color\":\"red\",\"sessions\":[{\"id\":\"a1\",\"label\":\"auth\","
+        "\"state\":\"needs you\",\"color\":\"red\"}]}";
+    std::string framed = std::string(json) + "\n";
+
+    bool everySplitWorked = true;
+    for (size_t cut = 0; cut <= framed.size(); cut++) {
+      BleLink link;
+      LineReader rd;
+
+      // Two writes, split at `cut`. This is what a two-chunk frame looks
+      // like at that MTU.
+      link.push((const uint8_t*)framed.data(), (uint16_t)cut);
+      link.push((const uint8_t*)framed.data() + cut,
+                (uint16_t)(framed.size() - cut));
+
+      Frame f;
+      bool got = false;
+      while (link.available() > 0) {
+        int c = link.read();
+        if (c < 0) break;
+        if (rd.feed((char)c)) {
+          got = parseFrame(rd.line(), &f);
+        }
+      }
+      if (!got || !f.hasColor || f.color != COLOR_RED || f.count != 1) {
+        everySplitWorked = false;
+        break;
+      }
+    }
+    check(everySplitWorked,
+          "a frame reassembles correctly at every possible chunk boundary");
+  }
+
+  // The minimum chunk size from the contract: 20 bytes, what every stack
+  // supports when no MTU is negotiated.
+  {
+    const char* json =
+        "{\"color\":\"yellow\",\"sessions\":[{\"id\":\"b2\","
+        "\"label\":\"build\",\"state\":\"working\",\"color\":\"yellow\"}]}";
+    std::string framed = std::string(json) + "\n";
+
+    BleLink link;
+    LineReader rd;
+    for (size_t off = 0; off < framed.size(); off += 20) {
+      size_t n = framed.size() - off;
+      if (n > 20) n = 20;
+      link.push((const uint8_t*)framed.data() + off, (uint16_t)n);
+    }
+
+    Frame f;
+    bool got = false;
+    while (link.available() > 0) {
+      int c = link.read();
+      if (c < 0) break;
+      if (rd.feed((char)c)) got = parseFrame(rd.line(), &f);
+    }
+    check(got && f.hasColor && f.color == COLOR_YELLOW,
+          "a frame in 20-byte chunks reassembles, the no-MTU minimum");
+  }
+
+  // Rule 5: a frame whose length is an exact multiple of the chunk size
+  // produces no empty trailing chunk, and the peripheral must not wait for
+  // one. Feeding exact multiples must still yield the frame.
+  {
+    std::string framed = "{\"color\":\"green\"}\n";
+    // Pad the label-free frame to a length divisible by 4.
+    while (framed.size() % 4 != 0) {
+      framed.insert(framed.size() - 1, " ");
+    }
+
+    BleLink link;
+    LineReader rd;
+    for (size_t off = 0; off < framed.size(); off += 4) {
+      link.push((const uint8_t*)framed.data() + off, 4);
+    }
+
+    Frame f;
+    bool got = false;
+    while (link.available() > 0) {
+      int c = link.read();
+      if (c < 0) break;
+      if (rd.feed((char)c)) got = parseFrame(rd.line(), &f);
+    }
+    check(got && f.hasColor && f.color == COLOR_GREEN,
+          "an exact multiple of the chunk size needs no empty final chunk");
+  }
+
+  // Two frames back to back in one write. The '\n' is the only delimiter, so
+  // the bytes after it begin the next frame.
+  {
+    std::string two =
+        "{\"color\":\"green\"}\n{\"color\":\"red\"}\n";
+
+    BleLink link;
+    LineReader rd;
+    link.push((const uint8_t*)two.data(), (uint16_t)two.size());
+
+    Frame f;
+    int frames = 0;
+    Color last = COLOR_OFF;
+    while (link.available() > 0) {
+      int c = link.read();
+      if (c < 0) break;
+      if (rd.feed((char)c) && parseFrame(rd.line(), &f)) {
+        frames++;
+        if (f.hasColor) last = f.color;
+      }
+    }
+    checkInt(frames, 2, "two frames in one write are two frames");
+    check(last == COLOR_RED, "and the second one is the one that stands");
+  }
+
+  // An empty queue reads -1, mirroring Serial.read(), so the drain loop in
+  // the sketch reads the same for both transports.
+  {
+    BleLink link;
+    checkInt((long)link.available(), 0, "a fresh queue is empty");
+    checkInt(link.read(), -1, "and reading it returns -1 like Serial does");
+  }
+
+  // The drop rule. A chunk that does not fit is dropped WHOLE: a partial
+  // write would put a hole in the middle of a frame, which costs that frame
+  // and can eat the following frame's newline too.
+  {
+    BleLink link;
+    std::string big(BLE_RX_CAPACITY - 1, 'x');
+    link.push((const uint8_t*)big.data(), (uint16_t)big.size());
+    uint16_t filled = link.available();
+    checkInt((long)filled, (long)(BLE_RX_CAPACITY - 1),
+             "the queue fills to capacity");
+
+    // One more byte cannot fit.
+    const uint8_t one = 'y';
+    link.push(&one, 1);
+    checkInt((long)link.available(), (long)filled,
+             "a chunk that does not fit is dropped rather than truncated");
+  }
+
+  // The queue wraps. Draining and refilling repeatedly must not corrupt
+  // anything, or a long-running light would rot after a few thousand frames.
+  {
+    BleLink link;
+    LineReader rd;
+    std::string framed = "{\"color\":\"red\"}\n";
+
+    int parsed = 0;
+    for (int round = 0; round < 400; round++) {
+      link.push((const uint8_t*)framed.data(), (uint16_t)framed.size());
+      Frame f;
+      while (link.available() > 0) {
+        int c = link.read();
+        if (c < 0) break;
+        if (rd.feed((char)c) && parseFrame(rd.line(), &f)) parsed++;
+      }
+    }
+    checkInt(parsed, 400, "400 frames through a wrapping queue all parse");
+  }
+
+  // A truncated frame, the failure the contract names first. The link drops
+  // mid-frame so the '\n' never arrives; the next frame's bytes append to
+  // the remains, producing one corrupt line. The cost must be ONE update,
+  // not a wedged reader.
+  {
+    BleLink link;
+    LineReader rd;
+
+    // Half a frame, no newline.
+    const char* half = "{\"color\":\"red\",\"sess";
+    link.push((const uint8_t*)half, (uint16_t)strlen(half));
+
+    Frame f;
+    int parsed = 0;
+    while (link.available() > 0) {
+      int c = link.read();
+      if (c < 0) break;
+      if (rd.feed((char)c) && parseFrame(rd.line(), &f)) parsed++;
+    }
+    checkInt(parsed, 0, "a truncated frame yields nothing");
+
+    // A whole frame follows. Its bytes join the orphaned prefix, so the
+    // first line is corrupt; the one after it is clean.
+    std::string next = "{\"color\":\"green\"}\n{\"color\":\"yellow\"}\n";
+    link.push((const uint8_t*)next.data(), (uint16_t)next.size());
+    Color last = COLOR_OFF;
+    while (link.available() > 0) {
+      int c = link.read();
+      if (c < 0) break;
+      if (rd.feed((char)c) && parseFrame(rd.line(), &f)) {
+        if (f.hasColor) last = f.color;
+      }
+    }
+    check(last == COLOR_YELLOW,
+          "the reader recovers on the frame after a truncation");
+  }
+
+  // A repeated frame, the second failure the contract names. After a
+  // reconnect the relay resends the current frame, so the same content can
+  // arrive twice. Applying it twice must be indistinguishable from once.
+  {
+    BleLink link;
+    LineReader rd;
+    Display d;
+    std::string framed =
+        "{\"color\":\"red\",\"sessions\":[{\"id\":\"a1\",\"label\":\"one\","
+        "\"state\":\"needs you\",\"color\":\"red\"}]}\n";
+
+    for (int i = 0; i < 2; i++) {
+      link.push((const uint8_t*)framed.data(), (uint16_t)framed.size());
+      Frame f;
+      while (link.available() > 0) {
+        int c = link.read();
+        if (c < 0) break;
+        if (rd.feed((char)c) && parseFrame(rd.line(), &f)) {
+          d.applyFrame(f, (uint32_t)(1000 + i * 1000));
+        }
+      }
+    }
+    checkInt(d.sessionCount(), 1, "a frame applied twice leaves one session");
+    checkStr(d.currentLabel(), "one", "and the same label");
+  }
+
+  // An oversized line must be discarded rather than growing the buffer, and
+  // the aggregate salvaged, exactly as over serial. The transport changes
+  // nothing about this.
+  {
+    BleLink link;
+    LineReader rd;
+
+    std::string huge = "{\"color\":\"red\",\"sessions\":[";
+    while (huge.size() < (size_t)SL_LINE_MAX + 200) {
+      huge += "{\"id\":\"padpadpadpadpadpad\",\"label\":\"padpadpadpad\"},";
+    }
+    huge += "]}\n";
+
+    // Push it in MTU-sized pieces, as the radio would.
+    Color salvaged = COLOR_OFF;
+    bool sawSalvage = false;
+    for (size_t off = 0; off < huge.size(); off += 180) {
+      size_t n = huge.size() - off;
+      if (n > 180) n = 180;
+      link.push((const uint8_t*)huge.data() + off, (uint16_t)n);
+
+      while (link.available() > 0) {
+        int c = link.read();
+        if (c < 0) break;
+        if (!rd.feed((char)c)) {
+          Color out;
+          if (rd.overflowColor(&out)) {
+            salvaged = out;
+            sawSalvage = true;
+          }
+        }
+      }
+    }
+    check(sawSalvage && salvaged == COLOR_RED,
+          "an oversized frame over BLE still surrenders its aggregate");
+  }
+
+  // A null or zero-length chunk is a no-op rather than a crash. A stack that
+  // reports a write with no payload must not take the light down.
+  {
+    BleLink link;
+    link.push(nullptr, 10);
+    link.push((const uint8_t*)"x", 0);
+    checkInt((long)link.available(), 0,
+             "a null or empty chunk changes nothing");
+  }
+
+  // Connection state is bookkeeping only. Nothing about frame handling reads
+  // it, so a frame that arrives while the flag says disconnected is still a
+  // frame.
+  {
+    BleLink link;
+    check(!link.connected(), "a fresh link is not connected");
+    link.onConnect();
+    check(link.connected(), "onConnect sets it");
+    link.onDisconnect();
+    check(!link.connected(), "onDisconnect clears it");
+
+    // And the queue is untouched by a disconnect: a partial line survives,
+    // which is what the contract requires.
+    link.push((const uint8_t*)"ab", 2);
+    link.onDisconnect();
+    checkInt((long)link.available(), 2,
+             "a disconnect does not discard queued bytes");
+  }
+}
+
 int main() {
   printf("stoplight firmware host checks\n\n");
 
@@ -2161,6 +2468,7 @@ int main() {
   testDisplayBehaviour();
   testStringHandling();
   testButton();
+  testBleLink();
 
   printf("\n%d checks, %d failures\n", gChecks, gFailures);
   if (gFailures != 0) {
