@@ -111,6 +111,8 @@ One dependency, which `make setup` installs:
 
 There is no JSON library in that list, which is deliberate. The frame parser is hand written, for the reasons in [Parsing](#parsing) below.
 
+There is no Bluetooth library either, and that is not an omission. `BLE` ships inside the ESP32 core, so the radio needs nothing installed beyond what `make setup` already fetches.
+
 ## The fastest smoke test
 
 This needs **no wiring at all** — the screen is soldered to the board, so a bare board and a data cable are the whole rig. It is the quickest way to prove a flash worked.
@@ -253,6 +255,7 @@ What the checks cover:
 | Rollover | Short and long presses stay correct across the `millis()` wrap, rotation measurably keeps cycling through it, and a red hold whose deadline lands on exactly 0 is still honoured |
 | Display | Rotation waits for scrolling, one session never rotates, a session keeps its slot, and a pin expires both ways |
 | Strings | Over-long values truncate, escapes decode, non-ASCII collapses to a single `?`, and a `\uXXXX` escape cut off by the end of the line reads nothing past the terminator |
+| BLE link | A frame reassembles at **every** byte boundary of a real frame, 20-byte chunks work, an exact multiple of the chunk size needs no empty final chunk, two frames in one write are two frames, an over-capacity chunk is dropped whole rather than truncated, a wrapping queue survives 400 frames, a truncated frame recovers on the next one, a repeated frame is idempotent, and an oversized line still surrenders its aggregate |
 
 The suite is a regression net for real defects and it fails loudly if any is reintroduced. Reverting `SL_LINE_MAX` to 512 and `SL_MAX_ID` to 24 turns 0 failures into 28. Each later fix is pinned the same way, measured by reverting it:
 
@@ -384,6 +387,30 @@ If the LEDs stay dark on a board that is otherwise working, this split is the fi
 
 `lamps.h` and `lamps.cpp` contain no reference to `Display`, and `display.h` and `display.cpp` contain no reference to `Lamps`. That separation is what makes "a pinned or rotating screen can never hide a red lamp" a structural property rather than a promise. See [How the pin is kept away from the lamps](#how-the-pin-is-kept-away-from-the-lamps).
 
+### Bluetooth
+
+The device serves BLE and USB serial at the same time, from one image. Which link the relay uses is the relay's choice: `--ble` selects the radio, and with no flag it looks for a serial light first and a Bluetooth one second. A build flag would make a decision at flash time about something discovered at run time.
+
+| | |
+|---|---|
+| Service | `6e5d0001-b5a3-f393-e0a9-e50e24dcca9e`, advertised |
+| Characteristic | `6e5d0002-b5a3-f393-e0a9-e50e24dcca9e`, write only |
+| Advertised name | `stoplight`, for humans only |
+
+**The central matches on the service UUID and nothing else.** A board that fails to advertise it is invisible however it is named, so `addServiceUUID` is the one line that makes the light findable at all.
+
+**`blelink.cpp` does not parse.** A chunk arrives, its bytes go into a queue, and `loop()` drains that queue into the same `LineReader` the cable uses. The contract says a BLE chunk is indistinguishable from a partial serial read, and feeding both into one reader is what makes that true in code rather than only on paper. Two readers would be two chances to disagree about the frame format, and the BLE one would be the one nobody watches.
+
+The queue is also the thread handoff. The write callback runs on the Bluetooth stack's task rather than the Arduino loop task, and parsing there would touch `Display` and `Lamps` from a second thread when neither is synchronised.
+
+**A chunk that does not fit is dropped whole.** A partial write leaves a hole in the middle of a frame, which costs that frame anyway and can consume the next frame's newline as well, so dropping one chunk is strictly cheaper than truncating one.
+
+**Advertising restarts on disconnect.** It stops on connect and does not resume by itself, so without that line the light is invisible after the first central ever disconnects and only a power cycle cures it.
+
+The wire contract both ends implement is `ble.ChunkContract` in `internal/transport/ble/contract.go`. It is a Go constant rather than a comment so neither end can change it silently.
+
+**The radio costs flash.** The image roughly doubles, from 26% to 51% of program storage, and RAM goes from 5% to 7%. Comfortable on a 4MB part, and worth knowing before choosing a partition scheme.
+
 ## How the pin is kept away from the lamps
 
 The guarantee, from [design.md](../design.md): *a pinned or rotating screen can never hide a red lamp*. The device's whole value is that a green glance is trustworthy, so this is enforced by structure rather than by care.
@@ -450,6 +477,7 @@ Two changes make that unreachable, and a third contains the damage if it somehow
 | `stoplight/protocol.{h,cpp}` | Frame struct, JSON parser, serial line reader |
 | `stoplight/display.{h,cpp}` | Screen, rotation, marquee scrolling, pin state |
 | `stoplight/lamps.{h,cpp}` | Three LEDs, PWM dimming |
+| `stoplight/blelink.{h,cpp}` | The GATT peripheral and the byte queue. No parsing: see [Bluetooth](#bluetooth) |
 | `stoplight/button.{h,cpp}` | Debounce, short and long press |
 
 Nothing blocks. There is no `delay()` in `loop()`; every timer is a `millis()` comparison, because a blocking wait would stall serial reads and make the button feel dead. All elapsed-time maths uses unsigned subtraction, so it stays correct across the `millis()` rollover at about 49 days.
@@ -464,7 +492,7 @@ Power: the screen blanks after five minutes with no frame and wakes on the next 
 
 **No host test can catch this, and the symptom is a screen that looks BROKEN rather than misconfigured.** That combination is why it is worth reading the list below before reaching for a multimeter.
 
-The 72×40 offset lives entirely inside the U8g2 constructor. The host stub replaces that constructor with one that records nothing about geometry, and there are no pixels on a host to inspect, so the whole test suite passes identically with the right constructor and the wrong one. The 402 checks say nothing at all about this. It is the single largest gap between "the tests pass" and "the device works".
+The 72×40 offset lives entirely inside the U8g2 constructor. The host stub replaces that constructor with one that records nothing about geometry, and there are no pixels on a host to inspect, so the whole test suite passes identically with the right constructor and the wrong one. The 440 checks say nothing at all about this. It is the single largest gap between "the tests pass" and "the device works".
 
 And when it is wrong there is no partial output to hint at it: no flicker, no clipped text, no garbled row. Every pixel lands outside the visible window, so the panel is **indistinguishable from a dead screen, an unpowered screen, a wrong I²C address, or a broken solder joint**. People replace the board over this. Rule the constructor out first, because it costs one line to check and it is the most likely cause by a wide margin.
 
@@ -546,6 +574,22 @@ That is correct. Rotation waits for scrolling, so slots with long labels hold th
 
 The no-handshake result is worth keeping. It is the reason `internal/transport/serial` can open the port with a plain `os.OpenFile` and stay on the standard library, and it was confirmed by writing a frame from a bare shell.
 
+**2026-09-11. The radio works, and the same image serves both links.** The relay drove the board over BLE with the USB cable supplying power only.
+
+| Proven | Detail |
+|---|---|
+| The light is findable | The relay matched it by service UUID alone, with no name, and connected |
+| Frames cross the radio | Red, yellow and green each confirmed by eye over BLE, one lamp at a time |
+| Reassembly | No send errors across the session: every chunked frame arrived whole and parsed |
+| Advertising resumes | A disconnect restarts advertising, so a second connection needs no power cycle |
+| Both links, one image | The radio starts alongside serial rather than instead of it, so the transport is the relay's choice at run time |
+
+The same three lamps were confirmed over USB serial immediately beforehand, which is what makes the comparison worth anything: the difference between the two runs was the transport and nothing else.
+
+**The radio costs flash, not correctness.** The image went from 350424 bytes (26%) to 680543 bytes (51%) of program storage, and RAM from 19372 (5%) to 25872 (7%). That is comfortable on a 4MB part and worth knowing before choosing a partition scheme.
+
+**The USB port name changes when the radio is enabled.** The board enumerated as `/dev/cu.usbmodem1101` before and `/dev/cu.usbmodem101` after. Nothing is wrong; `make ports` lists what is actually there, and `PORT=` overrides the guess.
+
 ### Still unverified: everything that needs parts not yet attached
 
 These are not doubts about the code. Nothing is wired to them yet, so nobody has looked.
@@ -553,7 +597,6 @@ These are not doubts about the code. Nothing is wired to them yet, so nobody has
 | Unverified | Needs |
 |---|---|
 | The button: short press pins, long press advances | A button on GPIO 3 |
-| BLE transport | Nothing wired, but untested against this board |
 | Battery life | A battery |
 | Enclosure fit | A printed enclosure |
 
@@ -562,18 +605,19 @@ These are not doubts about the code. Nothing is wired to them yet, so nobody has
 What was verified on a host compiler with U8g2 and the Arduino API stubbed out. Run it yourself with `cd firmware && make test`; see [Host tests](#host-tests).
 
 - All four modules and the sketch compile clean under `-Wall -Wextra -Wconversion -Wshadow`, with no warnings.
-- **402 behavioural checks pass** under AddressSanitizer and UndefinedBehaviorSanitizer.
+- **440 behavioural checks pass** under AddressSanitizer and UndefinedBehaviorSanitizer.
 - Those checks include: frames at 1, 4, 5 and 8 sessions all fitting the line buffer, an oversized frame surrendering its aggregate colour with `color` at either end of the frame, 36-character UUIDs staying distinct, duplicate ids never taking two slots, a value too deeply nested to skip costing one key rather than the aggregate behind it, rotation genuinely waiting for a long label to finish scrolling, the immediate jump on red, a red hold whose deadline lands on exactly 0 still being honoured, the pin stopping rotation and expiring both ways, a session keeping its slot as others leave, truncated and deeply nested input, a `\uXXXX` escape cut off at the end of a heap-exact buffer reading nothing past the terminator, and short/long press classification across the `millis()` rollover.
 - The U8g2 constructor, method signatures and font name were checked against the library source rather than recalled.
 
 ### What the host tests cannot reach
 
-The stubs are a model of the Arduino API, not the API itself. They cannot catch a linker error against the real core, a timing problem, an I²C fault, or anything about actual pixels. Three gaps are worth naming, because in each one a passing test suite means nothing at all:
+The stubs are a model of the Arduino API, not the API itself. They cannot catch a linker error against the real core, a timing problem, an I²C fault, or anything about actual pixels. Four gaps are worth naming, because in each one a passing test suite means nothing at all:
 
 | Gap | Why no test reaches it | What a failure looks like |
 |---|---|---|
 | **The 72×40 panel offset** | It lives inside the U8g2 constructor, which the stub replaces. There are no pixels on a host to inspect, so every check passes identically with the wrong constructor. | A screen that looks **dead**, not misconfigured — no flicker, no clipped text. Indistinguishable from a hardware fault. See [The screen is completely blank](#the-screen-is-completely-blank). *Closed on 2026-09-06: the panel renders.* |
-| **The LEDC API split in `lamps.cpp`** | The stub declares core 3.x, so only that branch is compiled, and its `ledcAttach`/`ledcWrite` do nothing but record a duty. The 2.x branch is compiled by nothing, anywhere. | LEDs that never light on an otherwise working board. See [the LEDC note](#the-ledc-api-split-is-unverified--read-this-before-you-flash). *Still open: no LEDs are wired.* |
+| **The LEDC API split in `lamps.cpp`** | The stub declares core 3.x, so only that branch is compiled, and its `ledcAttach`/`ledcWrite` do nothing but record a duty. The 2.x branch is compiled by nothing, anywhere. | LEDs that never light on an otherwise working board. See [the LEDC note](#the-ledc-api-split-is-unverified--read-this-before-you-flash). *Closed on 2026-09-10 for the 3.x branch: all three lamps light. The 2.x branch remains compiled by nothing.* |
+| **The radio itself** | `BleLink::begin()` is a no-op under `SL_HOST_TEST`, because there is no BLE stack on a host. The queue, the drop rule and the reassembly are plain C++ and are tested; advertising, the UUIDs and MTU negotiation are not. | A light nothing can find, or one that connects and never receives a frame. *Closed on 2026-09-11: the relay matched it by UUID and drove all three lamps over the radio.* |
 | **Anything about real I²C, timing or the USB CDC port** | The stubs have no transport and no clock; the test sets time directly. | A blank screen, an empty serial monitor, or a marquee at the wrong speed. *Closed on 2026-09-06 for I²C, the CDC port and the marquee.* |
 
 None of that substitutes for the panel lighting up. Check first that the screen renders at all, then that the marquee is readable at `DISP_SCROLL_STEP_MS`, and then that the LED brightness suits your diffuser.

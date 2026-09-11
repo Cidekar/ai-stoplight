@@ -2,11 +2,13 @@
 
 ## Status
 
-**Working over USB serial. Not yet wireless.**
+**Working over USB serial and over Bluetooth. Not yet on a battery.**
 
-Plug the light in and the whole chain runs: any producer posts to the relay, the relay tracks every session, and the lamps and screen follow. The Claude Code adapter installs itself, the relay installs as a service on all three platforms, and the enclosure generator produces printable STLs. The firmware's host harness passes 402 behavioural checks under the sanitizers.
+Plug the light in and the whole chain runs: any producer posts to the relay, the relay tracks every session, and the lamps and screen follow. The Claude Code adapter installs itself, the relay installs as a service on all three platforms, and the enclosure generator produces printable STLs. The firmware's host harness passes 440 behavioural checks under the sanitizers.
 
-The gap is the radio, and it is now half closed. The host end of BLE is written and tested: `--ble` selects it, and with no flag the relay looks for a serial light first and a Bluetooth one second. The firmware end is not, so the ESP32 still has no service to advertise and the light is a wired device today. Battery operation waits on the firmware half, because a battery with no radio is a light that cannot receive anything.
+The radio is closed. Both ends of BLE are written and both were driven against the real board: the relay finds the light by service UUID, and all three lamps were confirmed by eye over the radio with the cable supplying power only. `--ble` selects it, and with no flag the relay looks for a serial light first and a Bluetooth one second. One firmware image serves both links, so which one is used is a decision the relay makes at run time rather than one taken at flash time.
+
+The gap now is power. Nothing has ever run off a battery, and the low-battery warning has no mechanism: the C3 carries no fuel gauge, so a percentage needs a divider on an ADC pin or a different board.
 
 ## Build order
 
@@ -18,7 +20,7 @@ Status reflects what is in the tree, not what is planned.
 | 2 | RFC 1 ingest: the HTTP endpoint and the unix socket. Curl can drive the light. | No | **Done** |
 | 3 | The Claude Code adapter, plus service install for macOS. | No | **Done** |
 | 4 | ESP32 firmware over USB serial. Lamps first, then the screen. | Yes | **Done**, verified on real hardware |
-| 5 | BLE transport on both ends. | Yes | **Partial**, host side done, firmware side not |
+| 5 | BLE transport on both ends. | Yes | **Done**, verified on real hardware |
 | 6 | Battery, power tuning, and low-battery warning. | Yes | **Partial** |
 | 7 | Enclosure fit and finish against real parts. | Yes | **Partial** |
 | 8 | Service install for Linux and Windows. | No | **Done** |
@@ -29,15 +31,23 @@ Status reflects what is in the tree, not what is planned.
 
 **Step 3.** `internal/adapter/claudecode` writes and removes the four hook entries without clobbering anything else in `settings.json`, and `stoplight install` wires up the adapter and the service in one command.
 
-**Step 4.** `firmware/stoplight` drives the lamps over PWM, the 72×40 OLED, rotation, marquee scrolling and the button. It parses the frame format incrementally, so an oversized line still yields its aggregate colour. `firmware/test` runs the whole thing on a host: 402 checks, 0 failures, under AddressSanitizer and UndefinedBehaviorSanitizer. What the harness cannot check is the display offset, because there are no pixels on a host to inspect. See [firmware/readme.md](firmware/readme.md).
+**Step 4.** `firmware/stoplight` drives the lamps over PWM, the 72×40 OLED, rotation, marquee scrolling and the button. It parses the frame format incrementally, so an oversized line still yields its aggregate colour. `firmware/test` runs the whole thing on a host: 440 checks, 0 failures, under AddressSanitizer and UndefinedBehaviorSanitizer. What the harness cannot check is the display offset, because there are no pixels on a host to inspect. See [firmware/readme.md](firmware/readme.md).
 
-**Step 5.** Half. The host side is written: `internal/transport/ble` implements the `Transport` interface, `--ble` and `--ble-name` select it, and `selectTransport` auto-discovers serial first and BLE second. It matches the light by service UUID rather than by name, retries forever with backoff the way the serial transport does, and splits a frame into chunks that fit the negotiated ATT MTU. The failure paths are covered against a fake link, so none of it needs hardware to test. The `Transport` interface held: nothing above it changed.
+**Step 5.** Both ends. The host side is `internal/transport/ble`, which implements the `Transport` interface; `--ble` and `--ble-name` select it, and `selectTransport` auto-discovers serial first and BLE second. It matches the light by service UUID rather than by name, retries forever with backoff the way the serial transport does, and splits a frame into chunks that fit the negotiated ATT MTU. The `Transport` interface held: nothing above it changed.
 
-The firmware side is not written. The ESP32 advertises nothing and serves no GATT service, so there is no light to connect to yet, and the transport is unproven against real hardware. The reassembly contract the firmware has to implement is `ble.ChunkContract` in `internal/transport/ble/contract.go`, which is a constant rather than a comment so both ends quote one source.
+The firmware side is `firmware/stoplight/blelink.{h,cpp}`. It publishes the service and characteristic, advertises the service UUID, and queues the bytes it receives. **It does not parse.** The contract is explicit that a BLE chunk is indistinguishable from a partial serial read, so chunks go into a byte queue and `loop()` drains that queue into the same `LineReader` the cable uses. Two readers would be two chances to disagree about the frame format, and the BLE one would be the one nobody watches.
+
+The queue is also the thread handoff. The write callback runs on the Bluetooth stack's task rather than the Arduino loop task, and parsing there would touch `Display` and `Lamps` from a second thread when neither is synchronised.
+
+The contract both ends implement is `ble.ChunkContract` in `internal/transport/ble/contract.go`, a Go constant rather than a comment so neither side can change it silently.
+
+Verified on hardware on 2026-09-11: the relay found the light by UUID alone, and red, yellow and green were each confirmed by eye over the radio with the USB cable supplying power only. No send errors occurred across the session. The radio costs flash rather than correctness: the image went from 26% to 51% of program storage, and RAM from 5% to 7%.
 
 This is also where the project's first third-party dependency arrived, `tinygo.org/x/bluetooth`. Three unrelated platform Bluetooth stacks is not a thing to hand-roll. See CONTRIBUTING.md for the rule that replaced "standard library only".
 
 **Step 6.** The two firmware levers are in: the lamps run on PWM rather than at full current, and the screen powers the panel down after a period with no frames. The battery itself is not, and neither is any low-battery warning. The C3 has no fuel gauge, so a warning needs either a divider on an ADC pin or a different board.
+
+This step is no longer blocked, only unstarted. Step 5 closing means there is finally something to measure: a light on a battery has to hold a BLE connection, and the radio is the load that decides run time. The arithmetic could not be done against a wired device.
 
 **Step 7.** The models are parametric, every dimension lives in `enclosure/params.json`, and `gen_stl.py` produces the four STLs. `test_params.py` proves the `.scad`, the STL generator and the readme tables never drift from the JSON. None of it has been fitted against printed parts, which is the whole point of the step.
 
@@ -57,7 +67,7 @@ This is also where the project's first third-party dependency arrived, `tinygo.o
 
 ## Open questions
 
-**Battery life.** Still open, and now blocked on step 5 rather than on arithmetic. The two levers are already built: the firmware dims the lamps with PWM and powers the panel down when frames stop arriving. What is missing is the radio to measure against.
+**Battery life.** Still open, and no longer blocked: the radio exists, so there is something to measure. The two levers are already built, in that the firmware dims the lamps with PWM and powers the panel down when frames stop arriving. What is missing is a battery and a meter. The radio is the interesting load, because a light on a battery has to hold a connection rather than merely receive on one.
 
 **Low-battery warning.** Newly sharpened by the build. The C3 has no fuel gauge, so a percentage needs a divider on an ADC pin, or a different board. Nothing is implemented, and it may end up as a lamp pattern rather than a number, because the screen holds ten characters and a percentage is a poor use of them.
 
