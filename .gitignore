@@ -3,3 +3,10 @@ firmware/build/
 firmware/test/build/
 enclosure/stl/
 .claude/settings.local.json
+.claude/worktrees/
+
+# The relay binary, when built in place. `go build -o stoplight .` is the
+# obvious thing to type and drops 10MB in the repo root. Anchored with a
+# leading slash so it matches the artifact and never the firmware/stoplight
+# source directory.
+/stoplight
