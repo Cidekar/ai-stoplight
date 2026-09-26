@@ -62,7 +62,7 @@ func (s *systemd) Command() string {
 //
 // WantedBy=default.target is what makes `systemctl --user enable` start
 // the relay at login.
-func (s *systemd) unit(binPath string) []byte {
+func (s *systemd) unit(binPath string, relayArgs ...string) []byte {
 	var b bytes.Buffer
 	// A comment line, so that Install and Uninstall can tell this file
 	// from a unit at the same path that somebody else wrote.
@@ -78,7 +78,11 @@ func (s *systemd) unit(binPath string) []byte {
 
 	b.WriteString("[Service]\n")
 	b.WriteString("Type=simple\n")
-	b.WriteString("ExecStart=" + escapeUnitExec(binPath) + " relay\n")
+	b.WriteString("ExecStart=" + escapeUnitExec(binPath) + " relay")
+	for _, arg := range relayArgs {
+		b.WriteString(" " + escapeUnitPath(arg))
+	}
+	b.WriteString("\n")
 	b.WriteString("Restart=always\n")
 	b.WriteString("RestartSec=5\n")
 	b.WriteString("StandardOutput=append:" + escapeUnitPath(s.logFile) + "\n")
@@ -152,7 +156,7 @@ func validateUnitPath(kind, path string) error {
 }
 
 // Install writes the unit, reloads the manager and enables it at login.
-func (s *systemd) Install(binPath string) error {
+func (s *systemd) Install(binPath string, relayArgs ...string) error {
 	// Refuse a path a unit file cannot hold, before anything is changed.
 	// Both values reach a directive, so both are checked.
 	if err := validateUnitPath("binary path", binPath); err != nil {
@@ -160,6 +164,13 @@ func (s *systemd) Install(binPath string) error {
 	}
 	if err := validateUnitPath("log path", s.logFile); err != nil {
 		return err
+	}
+	// A relay argument reaches the ExecStart directive too, so a line break
+	// in one would split the directive exactly as a bad path would.
+	for _, arg := range relayArgs {
+		if err := validateUnitPath("relay argument", arg); err != nil {
+			return err
+		}
 	}
 	// Refuse a unit we did not write, before anything is changed.
 	if err := checkOwned(s.unitPath); err != nil {
@@ -169,7 +180,7 @@ func (s *systemd) Install(binPath string) error {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return fmt.Errorf("create %s: %w", dir, err)
 	}
-	if err := writeFileAtomic(s.unitPath, s.unit(binPath), 0o644); err != nil {
+	if err := writeFileAtomic(s.unitPath, s.unit(binPath, relayArgs...), 0o644); err != nil {
 		return err
 	}
 	// systemd caches unit files, so a rewrite is invisible until this.

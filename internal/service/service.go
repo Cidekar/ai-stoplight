@@ -24,7 +24,12 @@ import (
 // installed service and report an error if it is missing.
 type Manager interface {
 	// Install writes the service definition and enables it at login.
-	Install(binPath string) error
+	//
+	// relayArgs are appended after the "relay" subcommand in the definition,
+	// so `stoplight install --ble` bakes the transport choice into the
+	// service rather than leaving it to auto-discovery. They are variadic
+	// because the common install passes none and relies on discovery.
+	Install(binPath string, relayArgs ...string) error
 
 	// Uninstall stops the service and removes its definition.
 	Uninstall() error
