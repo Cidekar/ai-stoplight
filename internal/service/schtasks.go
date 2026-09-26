@@ -46,11 +46,15 @@ func (s *schtasks) Command() string {
 //
 // Task Scheduler has no supervisor equivalent to KeepAlive, so restart on
 // failure is configured separately in Install.
-func createArgs(binPath string) []string {
+func createArgs(binPath string, relayArgs ...string) []string {
+	tr := `"` + binPath + `" relay`
+	if len(relayArgs) > 0 {
+		tr += " " + strings.Join(relayArgs, " ")
+	}
 	return []string{
 		"/Create",
 		"/TN", taskName,
-		"/TR", `"` + binPath + `" relay`,
+		"/TR", tr,
 		"/SC", "ONLOGON",
 		"/RL", "LIMITED",
 		"/F",
@@ -58,8 +62,8 @@ func createArgs(binPath string) []string {
 }
 
 // Install registers the logon task, replacing any previous version.
-func (s *schtasks) Install(binPath string) error {
-	if out, err := s.run("schtasks", createArgs(binPath)...); err != nil {
+func (s *schtasks) Install(binPath string, relayArgs ...string) error {
+	if out, err := s.run("schtasks", createArgs(binPath, relayArgs...)...); err != nil {
 		return fmt.Errorf("schtasks /Create %s: %w: %s", taskName, err, strings.TrimSpace(string(out)))
 	}
 	return nil
