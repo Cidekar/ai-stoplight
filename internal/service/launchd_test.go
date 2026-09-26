@@ -112,6 +112,42 @@ func TestLaunchdPlistContent(t *testing.T) {
 	}
 }
 
+// TestLaunchdPlistCarriesRelayArgs proves the transport flags a user passes to
+// `stoplight install --ble` reach the plist as their own ProgramArguments
+// entries, after "relay". Baking them in is the whole point of the flag: the
+// service must launch with the chosen transport rather than auto-discovering.
+func TestLaunchdPlistCarriesRelayArgs(t *testing.T) {
+	l, _ := newTestLaunchd(t)
+	got := string(l.plist("/usr/local/bin/stoplight", "--ble-name", "StoplightA4"))
+
+	// Each argument is its own <string>, in order, right after the "relay"
+	// entry. A single joined string would reach the relay as one argument and
+	// fail to parse.
+	want := "<string>relay</string>\n" +
+		"\t\t<string>--ble-name</string>\n" +
+		"\t\t<string>StoplightA4</string>"
+	if !strings.Contains(got, want) {
+		t.Errorf("the relay args are missing or out of order:\n%s", got)
+	}
+
+	var v any
+	if err := xml.Unmarshal([]byte(got), &v); err != nil {
+		t.Errorf("the plist with relay args is not valid XML: %v", err)
+	}
+}
+
+// TestLaunchdPlistWithoutRelayArgsStopsAtRelay proves a bare install writes no
+// transport flag, so the service auto-discovers exactly as before. A stray flag
+// here would silently pin every default install to one transport.
+func TestLaunchdPlistWithoutRelayArgs(t *testing.T) {
+	l, _ := newTestLaunchd(t)
+	got := string(l.plist("/usr/local/bin/stoplight"))
+
+	if strings.Contains(got, "--ble") {
+		t.Errorf("a bare install wrote a transport flag:\n%s", got)
+	}
+}
+
 func TestLaunchdPlistEscapesXML(t *testing.T) {
 	// A home directory can contain an ampersand, which would otherwise
 	// produce a plist launchd silently refuses to load.

@@ -169,6 +169,32 @@ func TestSelectTransportAutoDiscoveryNeverFails(t *testing.T) {
 	}
 }
 
+// TestTransportChoiceRelayArgs proves the flags baked into a service definition
+// match what a user typed. install threads these into the plist, unit or task,
+// so a wrong rendering here launches the service on the wrong transport.
+func TestTransportChoiceRelayArgs(t *testing.T) {
+	cases := []struct {
+		name   string
+		choice transportChoice
+		want   []string
+	}{
+		{"nothing auto-discovers", transportChoice{}, nil},
+		{"ble", transportChoice{ble: true}, []string{"--ble"}},
+		{"ble name", transportChoice{bleName: "StoplightA4"}, []string{"--ble-name", "StoplightA4"}},
+		// A name implies --ble, so it must not emit both.
+		{"ble and name", transportChoice{ble: true, bleName: "StoplightA4"}, []string{"--ble-name", "StoplightA4"}},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := tc.choice.relayArgs()
+			if strings.Join(got, " ") != strings.Join(tc.want, " ") {
+				t.Errorf("relayArgs() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
 // TestBLEChunkContractIsReachableFromTheCLI is a canary. The firmware is
 // written against these constants, and the CLI is what a contributor runs to
 // find them, so a rename that leaves the docs pointing at nothing should fail

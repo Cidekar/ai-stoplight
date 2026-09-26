@@ -108,7 +108,8 @@ Commands:
   relay              run the relay in the foreground, the same as the bare
                      command. This is what the background service runs.
   install            detect installed agents, wire up an adapter for each,
-                     install the background service and start it
+                     install the background service and start it. Pass --ble
+                     or --ble-name to run the service on a Bluetooth light.
   uninstall          remove the adapters and the service
   status             service state, connection, sessions, and the underlying
                      service command
@@ -287,6 +288,23 @@ func selectTransport(ctx context.Context, choice transportChoice, stdout io.Writ
 	fmt.Fprintln(stdout, "stoplight: no light found, using the virtual light")
 	fmt.Fprintln(stdout, "stoplight: plug one in and restart, or pass --serial <path> or --ble")
 	return light.NewVirtual(stdout), nil
+}
+
+// relayArgs renders the choice as the flags a service definition passes to
+// `stoplight relay`. Only the transport is expressed here: the service keeps
+// the relay's own defaults for the address and the timeout, and an empty slice
+// means the service auto-discovers exactly as the bare relay does.
+//
+// A name implies --ble, matching selectTransport, so --ble-name alone is enough
+// and a definition never carries a name without the flag it belongs to.
+func (c transportChoice) relayArgs() []string {
+	switch {
+	case c.bleName != "":
+		return []string{"--ble-name", c.bleName}
+	case c.ble:
+		return []string{"--ble"}
+	}
+	return nil
 }
 
 // validate rejects flag combinations that ask for two different lights. Each
@@ -476,9 +494,22 @@ func splitEvent(args []string) (event string, flags []string) {
 // second run reports the same result rather than duplicating anything.
 func cmdInstall(args []string, stdout, stderr io.Writer) int {
 	fs := newFlagSet("install", stdout)
+	useBLE := fs.Bool("ble", false, "run the service against a Bluetooth light instead of auto-discovering")
+	bleName := fs.String("ble-name", "", "run the service against one named Bluetooth light")
 	if code, done := parseFlags(fs, args, stderr); done {
 		return code
 	}
+
+	// The transport flags are baked into the service definition, so the service
+	// launches with the same choice a bare `stoplight relay --ble` would make.
+	// Validating them here reuses the relay's own rules, so `install` rejects an
+	// impossible combination rather than writing a definition that cannot start.
+	choice := transportChoice{ble: *useBLE, bleName: *bleName}
+	if err := choice.validate(); err != nil {
+		fmt.Fprintf(stderr, "stoplight: %v\n", err)
+		return exitUsage
+	}
+	relayArgs := choice.relayArgs()
 
 	// Adapters write this path into hook entries that outlive the shell, so it
 	// has to be the resolved binary rather than whatever name argv[0] held.
@@ -534,7 +565,7 @@ func cmdInstall(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "stoplight: %v\n", err)
 		return exitError
 	}
-	if err := mgr.Install(binPath); err != nil {
+	if err := mgr.Install(binPath, relayArgs...); err != nil {
 		fmt.Fprintf(stderr, "stoplight: install the service: %v\n", err)
 		return exitError
 	}

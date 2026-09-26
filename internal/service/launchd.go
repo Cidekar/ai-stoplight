@@ -78,7 +78,7 @@ func (l *launchd) Command() string {
 // RunAtLoad starts the relay at login. KeepAlive restarts it if it dies.
 // Together they are the whole reason this package exists: a light that
 // needs a terminal open is a light you forget to start.
-func (l *launchd) plist(binPath string) []byte {
+func (l *launchd) plist(binPath string, relayArgs ...string) []byte {
 	var b bytes.Buffer
 	b.WriteString(xml.Header)
 	b.WriteString("<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n")
@@ -89,7 +89,7 @@ func (l *launchd) plist(binPath string) []byte {
 	b.WriteString("<dict>\n")
 	b.WriteString("\t<key>Label</key>\n\t<string>" + escapeXML(launchdLabel) + "</string>\n")
 	b.WriteString("\t<key>ProgramArguments</key>\n\t<array>\n")
-	for _, arg := range []string{binPath, "relay"} {
+	for _, arg := range append([]string{binPath, "relay"}, relayArgs...) {
 		b.WriteString("\t\t<string>" + escapeXML(arg) + "</string>\n")
 	}
 	b.WriteString("\t</array>\n")
@@ -118,7 +118,7 @@ func escapeXML(s string) string {
 
 // Install writes the plist and loads it. It is idempotent: an already
 // loaded agent is booted out first so the new definition takes effect.
-func (l *launchd) Install(binPath string) error {
+func (l *launchd) Install(binPath string, relayArgs ...string) error {
 	// Refuse a plist we did not write, before anything is changed. A
 	// definition at this path may belong to another tool, and overwriting
 	// it would silently take over its job.
@@ -128,7 +128,7 @@ func (l *launchd) Install(binPath string) error {
 	if err := l.ensureLogDir(); err != nil {
 		return err
 	}
-	if err := writeFileAtomic(l.plistPath, l.plist(binPath), 0o644); err != nil {
+	if err := writeFileAtomic(l.plistPath, l.plist(binPath, relayArgs...), 0o644); err != nil {
 		return err
 	}
 	// Ignore the error: the agent is usually not loaded yet, and an
