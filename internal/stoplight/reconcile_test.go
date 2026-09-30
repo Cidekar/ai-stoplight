@@ -93,18 +93,20 @@ func TestReconcileLeavesOtherProvidersAlone(t *testing.T) {
 	}
 }
 
-// An unattributed session IS reaped by a sync, and protecting it was a real
-// leak. The Claude Code hooks sent no provider, so every session they created
-// was unattributable and no sync could ever remove it: pre-warmed workers that
-// fire one event and are never dispatched piled up, and one of them holding a
-// red state kept the lamp red while every real session was fine.
+// An unattributed session is NOT reaped by another provider's sync. The RFC 13
+// and readme reference producers send no provider — the curl one-liner, the
+// stoplight_run shell wrappers, the Go snippet — and the Claude Code poller
+// runs by default, so reaping the unattributed deleted every one of them within
+// one 20s poll: a failed `stoplight_run make test` showed red for a moment and
+// then went off.
 //
-// An unattributed session has no other claimant by definition, so the syncing
-// producer is the best claim available. Removing it early costs one session
-// that its next report recreates. The other way costs an unfixable red.
-func TestReconcileReapsUnattributedSessions(t *testing.T) {
+// A sync speaks only for its own provider. The original leak it was meant to
+// fix — the Claude Code hooks sending no provider — was closed by attributing
+// the hooks, so a genuine Claude Code session is reaped by name now. A truly
+// stuck unattributed session is still bounded by the session timeout.
+func TestReconcileDoesNotReapUnattributedSessions(t *testing.T) {
 	tracker := NewTracker(testTimeout)
-	tracker.Apply(report("anon", "blocked"), base) // no provider
+	tracker.Apply(report("job-1", "blocked"), base) // reference producer, no provider
 
 	if got := tracker.Aggregate(); got != ColorRed {
 		t.Fatalf("Aggregate() = %v, want red", got)
@@ -112,16 +114,31 @@ func TestReconcileReapsUnattributedSessions(t *testing.T) {
 
 	tracker.Reconcile(syncOf("claude-code", time.Minute), base.Add(time.Minute))
 
-	if got := len(tracker.Sessions()); got != 0 {
-		t.Errorf("len(Sessions()) = %d, want 0: an unattributed session has no other claimant", got)
+	if got := len(tracker.Sessions()); got != 1 {
+		t.Errorf("len(Sessions()) = %d, want 1: a foreign sync must not delete an unattributed session", got)
 	}
-	if got := tracker.Aggregate(); got != ColorOff {
-		t.Errorf("Aggregate() = %v, want off: the stuck red must clear", got)
+	if got := tracker.Aggregate(); got != ColorRed {
+		t.Errorf("Aggregate() = %v, want red: the reference producer's red must survive", got)
 	}
 }
 
-// But a session belonging to a NAMED, different provider is still protected.
-// Two producers syncing on their own schedules must not delete each other.
+// A provider still reaps its OWN declared-absent sessions. Attribution is what
+// made that safe: a genuine Claude Code session names its provider, so a Claude
+// Code sync that omits it means it ended.
+func TestReconcileReapsItsOwnDeclaredAbsent(t *testing.T) {
+	tracker := NewTracker(testTimeout)
+	tracker.Apply(withProvider(report("mine", "blocked"), "claude-code"), base)
+
+	tracker.Reconcile(syncOf("claude-code", time.Minute), base.Add(time.Minute))
+
+	if got := len(tracker.Sessions()); got != 0 {
+		t.Errorf("len(Sessions()) = %d, want 0: a provider's own absent session is reaped", got)
+	}
+}
+
+// A session belonging to a NAMED, different provider is protected, and so is an
+// unattributed one. Two producers syncing on their own schedules must not delete
+// each other, and neither may delete a session no provider has claimed.
 func TestReconcileStillProtectsANamedOtherProvider(t *testing.T) {
 	tracker := NewTracker(testTimeout)
 	tracker.Apply(withProvider(report("theirs", "blocked"), "deepseek"), base)
@@ -129,12 +146,15 @@ func TestReconcileStillProtectsANamedOtherProvider(t *testing.T) {
 
 	tracker.Reconcile(syncOf("claude-code", time.Minute), base.Add(time.Minute))
 
-	sessions := tracker.Sessions()
-	if len(sessions) != 1 {
-		t.Fatalf("len(Sessions()) = %d, want 1", len(sessions))
+	survived := map[string]bool{}
+	for _, s := range tracker.Sessions() {
+		survived[s.ID] = true
 	}
-	if sessions[0].ID != "theirs" {
-		t.Errorf("surviving session = %q, want theirs", sessions[0].ID)
+	if !survived["theirs"] {
+		t.Errorf("another provider's session was reaped by a foreign sync")
+	}
+	if !survived["anon"] {
+		t.Errorf("an unattributed session was reaped by a foreign sync")
 	}
 	if got := tracker.Aggregate(); got != ColorRed {
 		t.Errorf("Aggregate() = %v, want red: another provider's red must survive", got)
