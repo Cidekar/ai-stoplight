@@ -46,6 +46,25 @@ type Session struct {
 // time if it never said.
 func (s *Session) ObservedAt() time.Time { return s.observedAt }
 
+// orderingTime is the timestamp Reconcile compares against a sync to decide
+// which reading is newer. It is observedAt when the producer supplied one, and
+// LastSeen otherwise.
+//
+// Every report to /v1/session carries no observedAt, so a session built only
+// from hooks holds the zero time there. A zero time loses every comparison,
+// which left hook-created sessions with no protection at all: a stale sync
+// could reverse a hook-delivered red or delete a session the hook had just
+// created. LastSeen is set to the arrival time of the last report, which is a
+// lower bound on when the producer observed the state, and is the honest key
+// to fall back to. RFC 1 section 5.4 asks for ordering by observation; arrival
+// is the best observation estimate a timestamp-less producer offers.
+func (s *Session) orderingTime() time.Time {
+	if !s.observedAt.IsZero() {
+		return s.observedAt
+	}
+	return s.LastSeen
+}
+
 // Display is the label actually shown, override first.
 func (s *Session) Display() string {
 	if s.Override != "" {
