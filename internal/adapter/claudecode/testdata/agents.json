@@ -1,0 +1,75 @@
+[
+  {
+    "pid": 1001,
+    "id": "sess0001",
+    "cwd": "/repo/example-1",
+    "kind": "background",
+    "startedAt": 1790000000001,
+    "sessionId": "sess0001-0000-0000-0000-000000000000",
+    "name": "auth refactor",
+    "status": "busy",
+    "state": "working"
+  },
+  {
+    "pid": 1002,
+    "id": "sess0002",
+    "cwd": "/repo/example-2",
+    "kind": "background",
+    "startedAt": 1790000000002,
+    "sessionId": "sess0002-0000-0000-0000-000000000000",
+    "name": "deploy",
+    "state": "blocked"
+  },
+  {
+    "pid": 1003,
+    "id": "sess0003",
+    "cwd": "/repo/example-3",
+    "kind": "background",
+    "startedAt": 1790000000003,
+    "sessionId": "sess0003-0000-0000-0000-000000000000",
+    "name": "release review",
+    "status": "waiting",
+    "state": "blocked"
+  },
+  {
+    "pid": 1004,
+    "id": "sess0004",
+    "cwd": "/repo/example-4",
+    "kind": "background",
+    "startedAt": 1790000000004,
+    "sessionId": "sess0004-0000-0000-0000-000000000000",
+    "name": "nightly",
+    "status": "idle",
+    "state": "done"
+  },
+  {
+    "pid": 2001,
+    "id": "sess0101",
+    "cwd": "/repo/example-5",
+    "kind": "interactive",
+    "startedAt": 1790000000101,
+    "sessionId": "sess0101-0000-0000-0000-000000000000",
+    "name": "translation service changes review",
+    "status": "busy"
+  },
+  {
+    "pid": 2002,
+    "id": "sess0102",
+    "cwd": "/repo/example-6",
+    "kind": "interactive",
+    "startedAt": 1790000000102,
+    "sessionId": "sess0102-0000-0000-0000-000000000000",
+    "name": "schema migration",
+    "status": "idle"
+  },
+  {
+    "pid": 2003,
+    "id": "sess0103",
+    "cwd": "/repo/example-7",
+    "kind": "interactive",
+    "startedAt": 1790000000103,
+    "sessionId": "sess0103-0000-0000-0000-000000000000",
+    "name": "incident triage",
+    "status": "waiting"
+  }
+]
