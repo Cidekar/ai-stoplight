@@ -278,25 +278,25 @@ func (t *Tracker) Reconcile(sync Sync, now time.Time) (changed bool) {
 	for id, session := range t.sessions {
 		switch {
 		case declared[id]:
-		case session.Provider != "" && session.Provider != provider:
-			// Another producer's session. Only a named, DIFFERENT provider is
-			// protected: a sync speaks for itself and must not delete work it
-			// knows nothing about.
+		case session.Provider != provider:
+			// Not this producer's session. A sync speaks only for the provider
+			// that sent it and must not delete work it knows nothing about,
+			// whether that work is another named producer's or unattributed.
 			//
-			// An UNATTRIBUTED session is not protected, and used to be. The
-			// reasoning was that a session which never named a producer could
-			// not honestly be claimed by one, which sounds careful and leaks
-			// without bound: the Claude Code hooks did not send a provider, so
-			// every session they created was unattributable and no sync could
-			// ever reap it. Pre-warmed workers that fire one event and are
-			// never dispatched accumulated forever, and one of them holding a
-			// red state kept the lamp red while every real session was fine.
-			//
-			// An unattributed session has no other claimant by definition, so
-			// the producer that is syncing is the best claim available. Being
-			// wrong costs one session removed early, and it will be recreated
-			// by its next report. Being wrong the other way costs a lamp that
-			// is permanently, unfixably red.
+			// Unattributed sessions used to be reaped here. That was added
+			// because the Claude Code hooks sent no provider, so every session
+			// they created was unattributable and no sync could ever remove it:
+			// pre-warmed workers that fire one event and are never dispatched
+			// accumulated forever, one holding a red state that kept the lamp
+			// red while every real session was fine. But the same change that
+			// added this reap also made the hooks send --provider, so a genuine
+			// Claude Code session is now attributed and this sync removes it by
+			// name. Reaping the unattributed on top of that hit the wrong
+			// target: the RFC 13 and readme reference producers send no
+			// provider, so any foreign sync deleted them within one poll. A
+			// stuck unattributed session is still bounded by the session
+			// timeout; a reference producer that is merely quiet is not, and
+			// must survive a poll it has nothing to do with.
 		case session.observedAt.After(sync.ObservedAt):
 			// Observed more recently than this sync was taken, so this sync
 			// cannot speak to whether it exists.
