@@ -391,6 +391,142 @@ func TestPollEmptyListIsNotAnError(t *testing.T) {
 	}
 }
 
+// The status table. Interactive sessions omit `state` and report only
+// `status`, so the status vocabulary must land on the same RFC 1 events the
+// state vocabulary does or a poll would fight the hooks it exists to correct.
+func TestEventForStatus(t *testing.T) {
+	tests := []struct {
+		status string
+		want   string
+		known  bool
+	}{
+		{"busy", "started", true},
+		{"idle", "finished", true},
+		// `waiting` is a session held for a human: blocked/red, not finished.
+		{"waiting", "blocked", true},
+		{"", "", false},
+		{"something-new", "", false},
+	}
+
+	for _, tt := range tests {
+		got, ok := eventForStatus(tt.status)
+		if ok != tt.known {
+			t.Errorf("eventForStatus(%q) known = %v, want %v", tt.status, ok, tt.known)
+		}
+		if got != tt.want {
+			t.Errorf("eventForStatus(%q) = %q, want %q", tt.status, got, tt.want)
+		}
+	}
+}
+
+// eventForEntry prefers `state` and falls back to `status`. The two fields can
+// disagree — a blocked session still reads status="idle" — and honouring
+// status there would turn a red lamp green, so state wins whenever it is
+// present. An empty field defers rather than counting as an unknown value.
+func TestEventForEntryPrefersState(t *testing.T) {
+	tests := []struct {
+		name  string
+		entry agentEntry
+		want  string
+		known bool
+	}{
+		{"state wins over a disagreeing status",
+			agentEntry{State: "blocked", Status: "idle"}, "blocked", true},
+		{"status is used when state is absent",
+			agentEntry{Status: "busy"}, "started", true},
+		{"waiting with no state maps to blocked",
+			agentEntry{Status: "waiting"}, "blocked", true},
+		{"an unknown state falls back to a known status",
+			agentEntry{State: "brand-new-state", Status: "idle"}, "finished", true},
+		{"both unknown is unrecognised",
+			agentEntry{State: "brand-new-state", Status: "brand-new-status"}, "", false},
+		{"both empty is unrecognised",
+			agentEntry{}, "", false},
+	}
+
+	for _, tt := range tests {
+		got, ok := eventForEntry(tt.entry)
+		if ok != tt.known {
+			t.Errorf("%s: eventForEntry known = %v, want %v", tt.name, ok, tt.known)
+		}
+		if got != tt.want {
+			t.Errorf("%s: eventForEntry = %q, want %q", tt.name, got, tt.want)
+		}
+	}
+}
+
+// A captured `claude agents --json` sample, real schema and all. This is the
+// regression for the bug that shipped: every interactive session reports only
+// `status`, so a poller that read `state` alone saw the empty string for each
+// one and re-declared it as working on every tick. The fixture holds the
+// background shapes (state present) and the interactive shapes (status only),
+// and the poll must colour all of them correctly.
+func TestPollHandlesCapturedInteractiveSample(t *testing.T) {
+	restore := pollCommand
+	t.Cleanup(func() { pollCommand = restore })
+
+	sample, err := os.ReadFile(filepath.Join("testdata", "agents.json"))
+	if err != nil {
+		t.Fatalf("read fixture: %v", err)
+	}
+	pollCommand = fakeCommand(t, string(sample))
+
+	a := New()
+	sessions, _, err := a.Poll(context.Background())
+	if err != nil {
+		t.Fatalf("Poll() error = %v", err)
+	}
+
+	want := map[string]string{
+		"sess0001-0000-0000-0000-000000000000": "started",  // working / busy
+		"sess0002-0000-0000-0000-000000000000": "blocked",  // blocked, no status
+		"sess0003-0000-0000-0000-000000000000": "blocked",  // blocked, status waiting
+		"sess0004-0000-0000-0000-000000000000": "finished", // done / idle
+		"sess0101-0000-0000-0000-000000000000": "started",  // interactive, status busy
+		"sess0102-0000-0000-0000-000000000000": "finished", // interactive, status idle
+		"sess0103-0000-0000-0000-000000000000": "blocked",  // interactive, status waiting
+	}
+	if len(sessions) != len(want) {
+		t.Fatalf("len(sessions) = %d, want %d", len(sessions), len(want))
+	}
+	for _, s := range sessions {
+		w, ok := want[s.SessionID]
+		if !ok {
+			t.Errorf("unexpected session %q", s.SessionID)
+			continue
+		}
+		if s.Event != w {
+			t.Errorf("session %s event = %q, want %q", s.SessionID, s.Event, w)
+		}
+	}
+}
+
+// The regression stated plainly: an interactive session that reports only
+// `status` must never poll as started merely because `state` was absent.
+func TestInteractiveIdleIsNotStarted(t *testing.T) {
+	restore := pollCommand
+	t.Cleanup(func() { pollCommand = restore })
+
+	pollCommand = fakeCommand(t, `[
+	  {"sessionId":"i1","cwd":"/tmp/one","name":"done here","kind":"interactive","status":"idle"}
+	]`)
+
+	a := New()
+	sessions, _, err := a.Poll(context.Background())
+	if err != nil {
+		t.Fatalf("Poll() error = %v", err)
+	}
+	if len(sessions) != 1 {
+		t.Fatalf("len(sessions) = %d, want 1", len(sessions))
+	}
+	if sessions[0].Event == "started" {
+		t.Errorf("idle interactive session event = started, want finished")
+	}
+	if sessions[0].Event != "finished" {
+		t.Errorf("idle interactive session event = %q, want finished", sessions[0].Event)
+	}
+}
+
 // fakeCommand writes a script that prints out and returns a command line that
 // runs it, so a poll can be tested without Claude Code installed.
 func fakeCommand(t *testing.T, out string) []string {
