@@ -216,6 +216,53 @@ func TestReconcileDoesNotRemoveASessionNewerThanTheSync(t *testing.T) {
 	}
 }
 
+// The case RFC 1 section 5.4 calls out and the ordering guards existed for, but
+// did not cover: a hook establishes a session, then a poll taken BEFORE the
+// hook fired arrives late and tries to reverse it. A report to /v1/session
+// carries no observedAt, so the guard has to fall back to arrival time or the
+// hook has no protection at all. Blocked landing by hook, then a stale poll
+// calling it working, must leave the lamp red — a human is being waited on.
+func TestReconcileDoesNotReverseANewerHook(t *testing.T) {
+	tracker := NewTracker(testTimeout)
+
+	// A hook starts the session, then a later hook blocks it.
+	tracker.Apply(withProvider(report("a", "started"), "claude-code"), base)
+	tracker.Apply(withProvider(report("a", "blocked"), "claude-code"), base.Add(11*time.Second))
+
+	// A poll taken at T+10s — before the block — arrives at T+11.5s and lists
+	// the session as working. It is older than the hook, so it must not win.
+	tracker.Reconcile(
+		syncOf("claude-code", 10*time.Second, report("a", "started")),
+		base.Add(11500*time.Millisecond),
+	)
+	if got := tracker.Aggregate(); got != ColorRed {
+		t.Errorf("Aggregate() = %v, want red: a stale poll reversed a hook-delivered red", got)
+	}
+}
+
+// The removal side of the same gap: a hook creates a session AFTER the poll
+// snapshot was taken, so the poll cannot know about it. Without an arrival-time
+// fallback the new session has a zero observedAt, loses the ordering guard, and
+// is deleted for not existing yet.
+func TestReconcileDoesNotRemoveANewerHook(t *testing.T) {
+	tracker := NewTracker(testTimeout)
+
+	// A hook creates a blocked session at T+1s.
+	tracker.Apply(withProvider(report("b", "blocked"), "claude-code"), base.Add(time.Second))
+
+	// An empty poll taken at T — before the hook — arrives late. It cannot
+	// speak to a session observed after its snapshot, so the session stays.
+	tracker.Reconcile(syncOf("claude-code", 0), base.Add(1500*time.Millisecond))
+
+	sessions := tracker.Sessions()
+	if len(sessions) != 1 || sessions[0].ID != "b" {
+		t.Fatalf("Sessions() = %v, want the hook session b to survive", sessions)
+	}
+	if got := tracker.Aggregate(); got != ColorRed {
+		t.Errorf("Aggregate() = %v, want red: a stale poll removed a newer hook session", got)
+	}
+}
+
 // A sync creates what it declares, in the state each entry implies. This is
 // how a relay that restarted recovers a session that is merely sitting idle
 // and would otherwise be invisible until it next moved.
