@@ -1,6 +1,7 @@
 package stoplight
 
 import (
+	"encoding/json"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -1485,16 +1486,57 @@ func TestApplyTruncatesOversizedFields(t *testing.T) {
 		t.Errorf("len(Provider) = %d, want %d", got, MaxProviderLen)
 	}
 
+	// The WIRE form is capped more tightly than storage: a frame field is
+	// bounded by the firmware's per-entry budget, not the relay's storage cap,
+	// so eight entries cannot overflow SL_LINE_MAX. See MaxFrameIDLen /
+	// MaxFrameLabelLen.
 	frame := tracker.Frame()
-	if got := len(frame.Sessions[0].ID); got != MaxSessionIDLen {
-		t.Errorf("frame ID length = %d, want %d: the wire form must be capped too",
-			got, MaxSessionIDLen)
+	if got := len(frame.Sessions[0].ID); got != MaxFrameIDLen {
+		t.Errorf("frame ID length = %d, want %d: the wire form uses the firmware cap",
+			got, MaxFrameIDLen)
 	}
-	if got := len(frame.Sessions[0].Label); got != MaxLabelLen {
-		t.Errorf("frame label length = %d, want %d", got, MaxLabelLen)
+	if got := len(frame.Sessions[0].Label); got != MaxFrameLabelLen {
+		t.Errorf("frame label length = %d, want %d", got, MaxFrameLabelLen)
 	}
 	if frame.Color != ColorRed {
 		t.Errorf("Color = %v, want red: truncation must not lose the light", frame.Color)
+	}
+}
+
+// slLineMax mirrors SL_LINE_MAX in firmware/stoplight/protocol.h, the device's
+// fixed line buffer. A frame whose encoded line exceeds it is dropped whole, so
+// this is the budget every frame the relay emits must stay under.
+const slLineMax = 1536
+
+// A frame at the worst case, MaxFrameSessions entries each with an id and label
+// at their storage caps, must fit the firmware line buffer. Before the wire
+// caps this frame ran to ~3.5KB and overflowed SL_LINE_MAX, so the device
+// discarded the session list and the screen went stale with no error either
+// side. The per-field wire caps keep the composed frame under the budget.
+func TestWorstCaseFrameFitsFirmwareLineBudget(t *testing.T) {
+	tracker := NewTracker(testTimeout)
+	for i := 0; i < MaxFrameSessions; i++ {
+		tracker.Apply(Report{
+			SessionID: strings.Repeat("i", MaxSessionIDLen-1) + strconv.Itoa(i),
+			Event:     "blocked",
+			Label:     strings.Repeat("L", MaxLabelLen),
+		}, base.Add(time.Duration(i)*time.Second))
+	}
+
+	frame := tracker.Frame()
+	if len(frame.Sessions) != MaxFrameSessions {
+		t.Fatalf("len(Sessions) = %d, want %d", len(frame.Sessions), MaxFrameSessions)
+	}
+
+	data, err := json.Marshal(frame)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	// The transport appends one '\n' as the frame delimiter, so the wire line
+	// is one byte longer than the marshalled object.
+	wire := len(data) + 1
+	if wire > slLineMax {
+		t.Errorf("worst-case frame = %d bytes, exceeds SL_LINE_MAX %d", wire, slLineMax)
 	}
 }
 
