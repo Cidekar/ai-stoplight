@@ -381,9 +381,18 @@ void Display::tick(uint32_t now) {
 
   bool minElapsed = (uint32_t)(now - slotEnteredAt_) >= DISP_ROTATE_MIN_MS;
 
-  bool holdOver = !holding_ || ((int32_t)(now - holdUntil_) >= 0);
+  // Clear the hold the moment its deadline passes, not when rotation finally
+  // happens. A hold that could only be lifted by rotating wedges whenever
+  // rotation cannot run: a lone red session, or any single session, holds
+  // forever. Worse, (int32_t)(now - holdUntil_) turns negative again 2^31 ms
+  // after the deadline, so a stale flag re-arms the block for the next 24.9
+  // days once a second session appears. Expiring the flag by its own deadline
+  // keeps the two in step and the window bounded.
+  if (holding_ && (int32_t)(now - holdUntil_) >= 0) {
+    holding_ = false;
+  }
 
-  if (canRotate && minElapsed && scrollFinished && holdOver) {
+  if (canRotate && minElapsed && scrollFinished && !holding_) {
     // Both conditions met: the minimum interval has passed AND the label has
     // finished scrolling. This is the whole of "rotation waits for
     // scrolling".

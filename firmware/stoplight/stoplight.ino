@@ -178,12 +178,21 @@ void loop() {
   }
 
   // 2. The button.
+  //
+  // A press is activity, exactly like a frame. Without this, step 4 below would
+  // blank the screen SCREEN_IDLE_MS after the last frame no matter how recently
+  // the button was pressed, so the press that togglePin/advance uses to wake a
+  // sleeping screen is undone on this same pass and the button cannot bring the
+  // screen back. Treating the press as activity keeps the woken screen up for a
+  // fresh idle interval, which is the whole point of pressing it.
   switch (button.update(now)) {
     case BUTTON_SHORT_PRESS:
       display.togglePin(now);
+      lastFrameAt = now;
       break;
     case BUTTON_LONG_PRESS:
       display.advance(now);
+      lastFrameAt = now;
       break;
     default:
       break;
