@@ -731,6 +731,31 @@ func TestListenSocketRemovesStaleFile(t *testing.T) {
 	listener.Close()
 }
 
+// listenSocket must refuse a path a live relay is already serving, rather than
+// unlinking the inode out from under it. The old unconditional remove let a
+// second relay on a different HTTP address silently steal socket ingest: the
+// first relay kept accepting on the unlinked inode and saw no error.
+func TestListenSocketRefusesLiveSocket(t *testing.T) {
+	socket := tempSocket(t, "sock")
+
+	live, err := listenSocket(socket)
+	if err != nil {
+		t.Fatalf("bind the first socket: %v", err)
+	}
+	defer live.Close()
+
+	second, err := listenSocket(socket)
+	if err == nil {
+		second.Close()
+		t.Fatal("listenSocket bound over a live socket, want an error")
+	}
+
+	// The first socket must still be the one a producer reaches.
+	if _, err := netDial(socket); err != nil {
+		t.Errorf("the live socket was unlinked: %v", err)
+	}
+}
+
 // listenSocket must create the parent directory, because the default path
 // lives under ~/.local/state which may not exist yet.
 func TestListenSocketCreatesParentDirs(t *testing.T) {
