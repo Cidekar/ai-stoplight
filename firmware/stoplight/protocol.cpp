@@ -420,13 +420,41 @@ bool parseFrame(const char* line, Frame* out) {
     return true;  // {} parses fine and instructs nothing
   }
 
+  // CORRUPTION vs TRUNCATION. A frame cut short mid-token is salvageable: the
+  // keys read before the cut are real, so the aggregate reaches the lamps and
+  // parseFrame returns true (see the note at done:). A frame that is GARBLED,
+  // not cut, is not salvageable, and its keys must not be trusted.
+  //
+  // The two are told apart by WHERE the grammar fails. A cut line fails because
+  // it ran out: the next byte is the NUL at the end of the buffer. A garbled
+  // line fails because the next byte is some character the grammar forbids
+  // there, which is exactly what a truncated frame glued to the next one looks
+  // like: {"color":"yellow","sess{"color":"green",...}, where the key "sess
+  // closes on the next frame's quote and the character after it is a 'c', not
+  // a ':'. Reading the glued line as "color":"yellow" kept the stale colour
+  // and lost the fresh frame. A key not followed by ':', with real bytes still
+  // ahead, is that frame boundary, so the whole line is refused and the next
+  // clean frame is awaited, the way hasSessions refuses an array that never
+  // closed.
+  bool corrupt = false;
+
   for (;;) {
     char key[24];
     if (!parseString(&p, key, sizeof(key) - 1)) {
-      break;  // malformed from here on; keep whatever we already read
+      // parseString fails on the first non-whitespace byte that is not a quote,
+      // or on running off the end mid-string. Only the former, with bytes still
+      // ahead, is a glued frame rather than a clean cut.
+      skipWhitespace(&p);
+      if (*p != '\0') {
+        corrupt = true;
+      }
+      break;
     }
     skipWhitespace(&p);
     if (*p != ':') {
+      if (*p != '\0') {
+        corrupt = true;  // a key with no colon, and bytes still ahead
+      }
       break;
     }
     p++;
@@ -434,6 +462,10 @@ bool parseFrame(const char* line, Frame* out) {
     if (strcmp(key, "color") == 0) {
       char c[12];
       if (!parseString(&p, c, sizeof(c) - 1)) {
+        skipWhitespace(&p);
+        if (*p != '\0') {
+          corrupt = true;  // the value is not a string, so the line is garbled
+        }
         break;
       }
       Color parsed;
@@ -555,14 +587,22 @@ bool parseFrame(const char* line, Frame* out) {
       p++;
       continue;
     }
-    break;  // '}' or truncation; either way we are finished
+    // A clean close is '}'; a clean cut is the end of the line. Anything else
+    // after a value is a second value with no separator, which again means two
+    // frames were glued together, so the line is refused.
+    if (*p != '}' && *p != '\0') {
+      corrupt = true;
+    }
+    break;
   }
 
 done:
-  // Always true if we saw an opening brace. A partially parsed frame still
-  // carries useful state, and dropping it would mean dropping a red lamp
-  // because a field we do not even read was malformed.
-  return true;
+  // A partially parsed frame still carries useful state, so a line that was
+  // merely CUT short returns true and the salvaged keys reach the lamps:
+  // dropping it would mean dropping a red lamp because a field we do not even
+  // read was malformed. A GARBLED line is different: its keys cannot be
+  // trusted, so it is refused and the next clean frame is awaited.
+  return !corrupt;
 }
 
 bool findAggregateColor(const char* prefix, Color* out) {
