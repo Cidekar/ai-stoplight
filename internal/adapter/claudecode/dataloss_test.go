@@ -110,6 +110,74 @@ func TestUninstallKeepsAnEventAnotherToolLeftEmpty(t *testing.T) {
 	}
 }
 
+// TestFreshUninstallKeepsAFileItDidNotCreate repeats the file-safety cases
+// with a second adapter for uninstall, the way the CLI actually runs them. The
+// record install leaves must grant no more licence than install's in-memory
+// state did: a file, hooks object or empty array the user put there is still
+// kept, because install never recorded creating it.
+func TestFreshUninstallKeepsAFileItDidNotCreate(t *testing.T) {
+	for _, original := range []string{
+		`{}`,
+		`{"hooks":{}}`,
+		`{"hooks":{"Stop":[]}}`,
+		`{"model":"opus","hooks":{"Stop":[]}}`,
+	} {
+		path := write(t, original)
+
+		if err := newForPath(path).Install(testBin); err != nil {
+			t.Fatalf("Install into %q: %v", original, err)
+		}
+		if err := newForPath(path).Uninstall(); err != nil {
+			t.Fatalf("Uninstall from %q: %v", original, err)
+		}
+
+		if _, err := os.Stat(path); err != nil {
+			t.Errorf("original %q: the settings file was deleted: %v", original, err)
+			continue
+		}
+		if _, err := decodeObject([]byte(read(t, path))); err != nil {
+			t.Errorf("original %q: the surviving file does not parse: %v", original, err)
+		}
+	}
+}
+
+// TestFreshUninstallKeepsAnEmptyArrayTheUserWrote is the subtle case the record
+// must get right. The user's "Stop": [] was present before install, so install
+// records that it did not create it, and a fresh-process uninstall must put it
+// back empty rather than deleting the key.
+func TestFreshUninstallKeepsAnEmptyArrayTheUserWrote(t *testing.T) {
+	original := `{"model":"opus","hooks":{"Stop":[]}}`
+	path := write(t, original)
+
+	if err := newForPath(path).Install(testBin); err != nil {
+		t.Fatalf("Install: %v", err)
+	}
+	if err := newForPath(path).Uninstall(); err != nil {
+		t.Fatalf("Uninstall: %v", err)
+	}
+
+	root, err := decodeObject([]byte(read(t, path)))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	hooksVal, ok := root.Get("hooks")
+	if !ok {
+		t.Fatalf("the user's \"hooks\" key was removed:\n%s", read(t, path))
+	}
+	hooks, ok := hooksVal.(*object)
+	if !ok {
+		t.Fatalf("\"hooks\" is not an object: %T", hooksVal)
+	}
+	stop, ok := hooks.Get("Stop")
+	if !ok {
+		t.Fatalf("the user's \"Stop\": [] was deleted:\n%s", read(t, path))
+	}
+	groups, ok := stop.([]any)
+	if !ok || len(groups) != 0 {
+		t.Errorf("\"Stop\" should be back to empty:\n%s", read(t, path))
+	}
+}
+
 // userMarkerHook is a hook the user wrote that happens to mention the
 // marker token. It is not ours: it does not start with the generated
 // prefix.

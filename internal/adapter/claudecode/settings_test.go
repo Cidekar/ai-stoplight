@@ -323,6 +323,46 @@ func TestUninstallRemovesFileItCreated(t *testing.T) {
 	}
 }
 
+func TestUninstallFromAFreshProcessRemovesFileItCreated(t *testing.T) {
+	// `stoplight install` and `stoplight uninstall` are separate processes, so
+	// uninstall runs on a brand new adapter with none of install's in-memory
+	// state. Installing into a missing file and uninstalling from a second
+	// adapter must still leave no stub behind.
+	path := filepath.Join(t.TempDir(), "settings.json")
+
+	if err := newForPath(path).Install(testBin); err != nil {
+		t.Fatalf("Install: %v", err)
+	}
+	if err := newForPath(path).Uninstall(); err != nil {
+		t.Fatalf("Uninstall: %v", err)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Errorf("a fresh-process uninstall left a stub behind: %q", read(t, path))
+	}
+}
+
+func TestUninstallFromAFreshProcessRemovesEmptyArrays(t *testing.T) {
+	// With a file that holds other settings, uninstall cannot delete the file,
+	// but it must still restore it to what install found rather than leaving a
+	// row of empty hook arrays and an empty "hooks" object behind.
+	path := write(t, `{"model":"opus"}`)
+
+	if err := newForPath(path).Install(testBin); err != nil {
+		t.Fatalf("Install: %v", err)
+	}
+	if err := newForPath(path).Uninstall(); err != nil {
+		t.Fatalf("Uninstall: %v", err)
+	}
+
+	root := decode(t, path)
+	if root["model"] != "opus" {
+		t.Errorf("the \"model\" key was lost:\n%s", read(t, path))
+	}
+	if _, ok := root["hooks"]; ok {
+		t.Errorf("an emptied \"hooks\" object was left behind:\n%s", read(t, path))
+	}
+}
+
 func TestUninstallKeepsForeignGroupInSameEvent(t *testing.T) {
 	// A group carrying a matcher and another tool's entry must not be
 	// removed just because we pruned nothing from it.
