@@ -4,7 +4,7 @@
 
 ## Abstract
 
-This document specifies how any agent reports its status to a Stoplight device. The protocol is a single HTTP endpoint carrying four semantic events. It names no vendor, no model, and no framework, and it requires no library.
+This document specifies how any agent reports its status to a Stoplight device. The protocol is a single HTTP endpoint carrying four core semantic events, plus one optional fifth, `idle`. It names no vendor, no model, and no framework, and it requires no library.
 
 The protocol is deliberately small enough to implement in ten lines of any language. That is the whole design goal: a tool released next year should be able to drive a light built this year, without either knowing about the other.
 
@@ -61,7 +61,7 @@ A producer reports **what happened**. The relay decides **what the light does**.
    a CI job    ──┘          at once
 ```
 
-Only the left hop is specified here. How a relay reaches its device is an implementation matter: the reference relay uses USB serial today and BLE is planned, and a producer sees no difference either way.
+Only the left hop is specified here. How a relay reaches its device is an implementation matter: the reference relay uses USB serial or BLE, and a producer sees no difference either way.
 
 The left column is open-ended by design. This document describes what a producer sends, never what a producer is.
 
@@ -334,7 +334,7 @@ A relay MUST compute this over every session regardless of provider, and MUST NO
 
 The `label` is what appears on the device screen, so a human can tell which session needs them.
 
-Producers SHOULD send something short and distinguishing. The reference device shows about **ten characters per line**, so a label is a name, not a sentence.
+Producers SHOULD send something short and distinguishing. The reference device shows about **eight characters per line**, so a label is a name, not a sentence.
 
 Good: `auth-api`, `payments`, `nightly-e2e`
 Poor: `Refactoring the authentication module to use refresh tokens`
