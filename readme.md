@@ -12,9 +12,8 @@
         │    (   )  │    green   done
         │           │
         ├───────────┤
-        │ ▪ 2/4     │
+        │ ▪ ● · ·   │
         │ auth-api  │  ← which job is waiting
-        │ ● needs   │
         ╰───────────╯
 ```
 
@@ -52,13 +51,13 @@ Three pieces, and you only ever touch the first one.
    a test suite──┼── HTTP ──▶  one Go   ─serial─▶    │  ( ● )    │
    a slow build──┤             binary                │  (   )    │
    a deploy    ──┘             tracks   ╌╌╌BLE╌╌▶    │  (   )    │
-                               every     planned     │ auth-api  │
+                               every     or wired    │ auth-api  │
      "I am working"            session               └───────────┘
      "I need a human"          at once                on your desk
      "I am done"
 ```
 
-USB serial is the link that works today. BLE is designed and is the next step on the [roadmap](roadmap.md), but it is not implemented, so the light is a wired device for now.
+USB serial and BLE both work. The relay auto-discovers a USB light, and `--ble` runs it against a Bluetooth light instead. The two transports sit behind one interface, so a producer sees no difference either way.
 
 Nothing in that left column is privileged. They all send the same four events to the same endpoint, and the relay weighs them identically.
 
@@ -66,7 +65,7 @@ Nothing in that left column is privileged. They all send the same four events to
 
 **One small Go binary decides what matters.** It tracks every session from every tool at once and resolves them to a single answer. Red beats yellow beats green, always. No web server to configure, no database, no config file to hand-write.
 
-**The light does the telling.** Awake the moment something changes. It connects over USB serial today, and the board and the design are ready for the battery-powered BLE version that comes next.
+**The light does the telling.** Awake the moment something changes. It connects over USB serial or BLE, so you can wire it or run it from the battery.
 
 Here is one moment, end to end:
 
@@ -131,9 +130,9 @@ Full specification in [RFC 1](rfc.md), with reference clients in shell, Python a
 stoplight install     # adapters for what you have, plus a service at login
 ```
 
-One command. It detects which agents are installed, wires up an adapter for each, installs a background service, and starts it. `stoplight uninstall` reverses all of it. Both are idempotent, so running them twice changes nothing.
+One command. It wires up an adapter for every agent built into the binary, installs a background service, and starts it. `stoplight uninstall` reverses all of it. Both are idempotent, so running them twice changes nothing. Pass `--ble` or `--ble-name <name>` to pin the service to a Bluetooth light.
 
-For Claude Code that means four hook entries in `~/.claude/settings.json`. For anything else, point it at the endpoint and there is nothing to install at all.
+For Claude Code that means five hook entries in `~/.claude/settings.json`. For anything else, point it at the endpoint and there is nothing to install at all.
 
 After that the light works without you thinking about it. `stoplight` on its own runs the relay in the foreground, which is what you want while developing or debugging, but the service means you never have to.
 
@@ -153,13 +152,13 @@ All three are user-level, not system-level. The relay needs no privileges, it ne
 
 `RunAtLoad` and `KeepAlive` are both set on macOS, with the equivalents elsewhere. If the relay crashes, the service manager restarts it. If the light is unplugged, the relay stays up and keeps retrying rather than exiting, because exiting would look identical to a crash.
 
-Logs go to `~/.local/state/stoplight/stoplight.log`, or the platform equivalent. Every event is recorded on arrival, so one file answers whether a producer reported, whether the relay saw it, and whether the light acknowledged it. The service appends to that one file and nothing rotates it yet, so truncate it yourself if it grows. Rotation is planned.
+Logs go to `~/.local/state/stoplight/stoplight.log`, or the platform equivalent. The relay records lifecycle events: when it starts listening, when the light connects or drops and reconnects, when a poll or a send fails, and when an ingest is rejected. A successful event is not logged line by line, because that would fill the file on a busy desk. The service appends to that one file and nothing rotates it yet, so truncate it yourself if it grows. Rotation is planned.
 
 ### Managing it
 
 | Command | What it does |
 |---|---|
-| `stoplight status` | Service state, connection, current sessions |
+| `stoplight status` | Service state, light connection, session count and aggregate |
 | `stoplight restart` | Bounce the service |
 | `stoplight logs` | Tail the log |
 | `stoplight service stop` | Stop until next login |
@@ -199,28 +198,23 @@ The adapter maps Claude Code's hooks onto those events. This is the only place a
 | `PreToolUse` | | `started` |
 | `Notification` | `permission_prompt` | `blocked` |
 | `Stop` | | `finished` |
+| `SessionEnd` | | `ended` |
 
 The matcher keeps a hook to the sub-event that means the event. `SessionStart` fires on more than a fresh start, so it is pinned to `startup`, or an auto-compaction mid-turn would read as idle. `Notification` fires on more than a permission prompt, so it is pinned to `permission_prompt`, or a routine idle reminder would turn the light red. `PreToolUse` carries the `started` that clears `blocked`: after you approve a prompt the agent runs a tool, and this is what returns the session to working before the turn ends.
 
+`SessionEnd` is what makes a closed session leave the light. It fires on exit, on Ctrl-D and on abnormal termination.
+
 Adding another agent is a new adapter, or no adapter at all if it can post directly. See [RFC 1 §10](rfc.md#10-adapters).
 
-It also appends a line to a log file on every call. When the light does not respond, that log is what tells you whether the event arrived at all.
+#### Hooks report changes, a poll fills the gaps
 
-#### Sessions already open are invisible until they next do something
+The hooks are edge-triggered: they fire on a transition, never on a state. On their own they miss two things. A session that was open before the relay started has no transition to announce itself with. A window that is killed with `kill -9`, a closed terminal or a crash skips `Stop` and `SessionEnd`, so the session stays in the relay at whatever colour it held.
 
-Every hook is edge-triggered: it fires on a transition, never on a state. Nothing enumerates sessions, and the relay holds no address for a producer, so it cannot ask what is already running. A session that was open before the relay started has no pending transition to announce itself with, and the light does not know it exists.
+The Claude Code adapter closes both gaps with a poll. It reads `claude agents --json` every twenty seconds and declares the whole live set to the relay as a sync, per [RFC 1 §5.4](rfc.md#54-the-sync-endpoint). A session the agent already runs appears in the next poll and the light learns it exists. A session that vanished without a final event is absent from the next poll and the relay ends it. One poll after a relay restart restores the whole picture.
 
-**Nothing needs restarting.** Type anything in that window and `UserPromptSubmit` fires, the session registers, and it behaves normally from then on. The rule in practice: an idle old window is invisible until you touch it. A window you never touch again stays dark, which is the right answer anyway, because it is not telling you anything.
+The poll corrects, it does not replace the hooks. A hook moves the lamp the instant something changes, which is the whole point of the device. The poll runs on its own schedule and never sits on the hook path. See [RFC 1 §10.1](rfc.md#101-discovery-mechanisms).
 
-This is the direct cost of [push, not polling](roadmap.md#decisions-already-made), and it is the correct trade. Inferring "is this waiting for a human" from outside the agent is unreliable, and a light that is sometimes wrong is worse than no light.
-
-#### A killed window leaves a session behind
-
-There is no hook for "this process was killed". Closing a terminal, `kill -9`, or a crash all skip `Stop`, so no `finished` or `ended` event is ever sent and the session stays in the relay at whatever colour it held.
-
-That matters when the colour was red: the lamp stays red for a session that no longer exists, and no amount of waiting clears it. Sessions carry a `last_seen` timestamp, visible in `GET /v1/status`, so a stale entry is easy to spot — it is the one whose `last_seen` stopped moving.
-
-Clear it by hand with the id from the status endpoint:
+For a producer that only reports and cannot be polled, a stale red session clears by hand. Sessions carry a `last_seen` timestamp, visible in `GET /v1/status`, so a stale entry is the one whose `last_seen` stopped moving. End it with its id:
 
 ```bash
 curl -s -X POST http://127.0.0.1:7373/v1/session \
@@ -249,11 +243,11 @@ The lamps tell you the state. The screen tells you which job that state belongs 
 A producer can send a label. If it does not, the relay derives one.
 
 ```
+·
 auth-api
-● working
 ```
 
-The derived label is the git branch of the session's working directory, falling back to the directory name, then the provider name, then the session ID. Branches are usually named after the work, so this is free and it is usually right. A detached HEAD has no branch name, so it falls through to the directory name like any other case.
+The header is a row of dots, one per session, with the current one filled. Below it the screen draws the label. The screen carries no state word, because the lamps already say the state in colour from across the room. The derived label is the git branch of the session's working directory, falling back to the directory name, then the provider name, then the session ID. Branches are usually named after the work, so this is free and it is usually right. A detached HEAD has no branch name, so it falls through to the directory name like any other case.
 
 A producer can send its own instead, and you can override any session by hand.
 
@@ -264,18 +258,17 @@ stoplight task --session-id <id> --clear
 
 That overrides the label until the session ends or you clear it. `--clear` removes the override, so the derived label shows again.
 
-The session ID is not optional. There is no "current session" concept yet, because nothing tells the CLI which of your sessions the terminal you are typing in belongs to, so the command asks you which one you mean. `stoplight status` lists the live IDs.
+The session ID is not optional. There is no "current session" concept yet, because nothing tells the CLI which of your sessions the terminal you are typing in belongs to, so the command asks you which one you mean. `stoplight status` prints a session count, not the ids; read the ids from `GET /v1/status`, which lists each session with its `id`.
 
 ### Rotation
 
 With more than one session running, the screen cycles through them. Each session gets the screen for at least three seconds, then the display advances.
 
-Order is by session start time, so a session keeps its place in the cycle as others come and go. A single session does not rotate, because a cycle of one is a static screen that redraws for no reason. A counter in the corner shows position in the set.
+Order is by session start time, so a session keeps its place in the cycle as others come and go. A single session does not rotate, because a cycle of one is a static screen that redraws for no reason. The row of dots in the header shows position in the set: one dot per session, the current one filled. The shape of the row says both how many sessions there are and where you are in the cycle, without the eye reading two digits.
 
 ```
-▪ 2/4
+▪  ● · · ·
 stoplight
-● working
 ```
 
 Two rules keep rotation from hiding things.
@@ -286,11 +279,11 @@ When a session turns red, the screen jumps to it immediately and holds for a ful
 
 ### Scrolling
 
-The screen holds about ten characters per line, which is narrower than many branch names. Labels that do not fit scroll.
+The label line holds about eight characters, which is narrower than many branch names. Labels that do not fit scroll.
 
 Scrolling is a marquee, not a loop. The label holds at the start for a second, scrolls left at a readable rate, holds at the end, then resets. A continuous wrap-around never gives a stable moment to read the first characters, which is where the useful part of a branch name usually is.
 
-Three limits keep it calm. Labels that already fit are drawn statically and never move. The state line never scrolls, because `working` and `needs you` are short and are what you read at a glance. Scrolling resets to the start whenever the session changes colour.
+Two limits keep it calm. Labels that already fit are drawn statically and never move. Scrolling resets to the start whenever the session changes colour.
 
 Rotation waits for scrolling. The three second interval is a minimum, not a fixed period, so a slot holds until its label has finished scrolling and then advances. Rotation therefore runs slightly irregularly, paced by content rather than a clock.
 
@@ -311,7 +304,7 @@ A pin releases itself. It clears when that session ends, and it clears after a t
 
 Pinning changes the screen and never the lamps. A pinned green session with a red session running still gives a red lamp. The pin must not be able to hide an alert.
 
-The pin lives in the firmware, so it survives a dropped link and reconnection. It is a property of the device rather than of the session list, which is what will let it survive a dropped BLE link too.
+The pin lives in the firmware, so it survives a dropped link and reconnection over either transport. It is a property of the device rather than of the session list, which is what lets it survive a dropped BLE link too.
 
 Long press was chosen over a double tap. A double tap needs a timing window between presses, and pressing a button set into a small case rocks the case on the desk, which makes that window unreliable. A long press has no window, only a duration, and a missed long press reads as a short press instead of doing nothing visible.
 
@@ -320,14 +313,14 @@ Long press was chosen over a double tap. A double tap needs a timing window betw
 Two hops. Producers talk to the relay over HTTP, specified in [RFC 1](rfc.md). The relay then talks to the light, described here.
 
 ```
-  any producer ──HTTP──▶ relay ──USB serial──▶ light
+  any producer ──HTTP──▶ relay ──serial or BLE──▶ light
                  RFC 1            frame format below
                  public           private, may change
 ```
 
 Only the first hop is a public contract. The frame format below is between this relay and this firmware, and can change without breaking a single producer.
 
-One JSON object per line, newline-terminated, over a USB serial port. The format is transport-agnostic on purpose: when BLE lands it carries the same lines over a characteristic, and the firmware parses one format either way.
+One JSON object per line, newline-terminated. The format is transport-agnostic on purpose: serial sends each line over the wire and BLE sends the same line over a characteristic, and the firmware parses one format either way.
 
 The relay sends the whole session list on every change, not one line of text.
 
@@ -343,21 +336,21 @@ The relay sends the whole session list on every change, not one line of text.
 | `color` | `red`, `yellow`, `green`, `off` | Aggregate. Drives the lamps. |
 | `sessions` | array | One entry per active session, ordered by start time |
 | `sessions[].id` | any string | Stable for the life of the session |
-| `sessions[].label` | any string | Top line. Scrolled by the firmware if it overflows. |
-| `sessions[].state` | any string | Bottom line |
+| `sessions[].label` | any string | The label line. Scrolled by the firmware if it overflows. |
+| `sessions[].state` | any string | Carried for compatibility. The firmware stores it but no longer draws it; the lamps show the state. |
 | `sessions[].color` | `red`, `yellow`, `green` | This session's own state |
 
 Every field is optional. A message carrying only `color` moves the lamps and leaves the screen alone. Unknown fields are ignored, so the app and firmware can be updated independently.
 
-Sending the full list rather than rotation frames keeps the link quiet and puts rotation, scrolling and pinning in the firmware, where they keep working if the link drops. That matters little over a wire and matters a great deal over a radio, which is why the format was chosen this way before BLE exists. The `id` field is what lets a pin survive an update to the list.
+Sending the full list rather than rotation frames keeps the link quiet and puts rotation, scrolling and pinning in the firmware, where they keep working if the link drops. That matters little over a wire and matters a great deal over a radio, which is why the format was chosen this way. The `id` field is what lets a pin survive an update to the list.
 
-The screen is monochrome and holds about ten characters per line. Colour lives in the lamps, not the display.
+The screen is monochrome and holds about eight characters on the label line. Colour lives in the lamps, not the display.
 
 JSON costs a few bytes over a single-character protocol and pays that back the first time you open a serial monitor and can read what is happening.
 
 ## Hardware
 
-The light is an ESP32 with BLE hardware, three LEDs, a screen, and a LiPo battery. The firmware talks over USB serial today. The radio is on the board and unused, waiting for the BLE transport.
+The light is an ESP32 with BLE hardware, three LEDs, a screen, and a LiPo battery. The firmware talks over USB serial or BLE. The radio and the cable carry the same frames, so you choose the link at the relay.
 
 ### Board
 
@@ -365,7 +358,7 @@ The board is an **ESP32-C3 SuperMini with 0.42 inch OLED**.
 
 It is 25 × 20.5mm, roughly a postage stamp, with a 72×40 OLED soldered on and a ceramic BLE antenna. The screen is part of the board, so there is no separate display module and no I²C wiring. Thirteen GPIOs are broken out, which is far more than the three the lamps need.
 
-The screen is small. The lit area is 9.2 × 5.2mm, and it holds about ten characters per line across five lines. That is enough for a branch name and a state word, which is all the label needs to be. It is a status light, not a terminal.
+The screen is small. The lit area is 9.2 × 5.2mm. The firmware draws two rows: a header of position dots and one label line of about eight characters. That is enough for a branch name, which is all the label needs to be. It is a status light, not a terminal.
 
 The board has no charging circuit, so a TP4057 module supplies one for three wires.
 
@@ -454,9 +447,9 @@ A 1A module charges a 500mAh cell at about 2C, which is faster than the cell pre
 
 ### Power
 
-BLE is what will let this run on a battery, and until it exists the USB cable powers the light as well as carrying its frames. The rest of this section describes the battery build the BLE step unlocks, and the parts list already covers it.
+BLE is what lets this run on a battery. Over USB the cable powers the light as well as carrying its frames; over BLE the cell carries it alone. The parts list already covers the battery build.
 
-The radio idles at a few milliamps, so the LEDs dominate the draw. A 500mAh cell should give a day or two of use, because only one lamp is lit at a time and the light is idle for most of a working day. That is arithmetic, not measurement: real numbers come after the BLE transport does.
+The radio idles at a few milliamps, so the LEDs dominate the draw. A 500mAh cell should give a day or two of use, because only one lamp is lit at a time and the light is idle for most of a working day. That is arithmetic, not measurement.
 
 Two things extend it. The firmware dims the LEDs with PWM rather than driving them at full current, which costs nothing visually behind a diffuser. It also blanks the screen after a period with no updates and wakes it on the next message.
 
@@ -481,8 +474,8 @@ Four printed parts: a body, three lens inserts, a back cover, and a button plung
      │     ╰─────╯   │
      ├───────────────┤
      │  ┌─────────┐  │
-     │  │ auth-api│  │   board clips into printed rails
-     │  │ ● needs │  │   no screws
+     │  │ ● · ·   │  │   board clips into printed rails
+     │  │ auth-api│  │   no screws
      │  └─────────┘  │
      └───────────────┘
        ├── 36mm ──┤
@@ -500,13 +493,13 @@ internal/stoplight/   state machine, session tracking, aggregation
 internal/relay/       the long-running process, HTTP and socket ingest
 internal/adapter/     one package per agent, claudecode is the first
 internal/service/     launchd, systemd and scheduled task install
-internal/transport/   USB serial today, BLE planned, behind one interface
+internal/transport/   USB serial and BLE, each behind one interface
 internal/light/       virtual light for development
 internal/notify/      the one-shot client used by hooks
 firmware/             ESP32 firmware
 ```
 
-Transports sit behind one interface, so nothing above it cares which is connected. `internal/transport/serial` is the only hardware transport that exists; BLE will be a second package implementing the same interface, and nothing above it changes when it lands. The virtual light implements that interface too and prints to the terminal, so the whole system is testable without hardware.
+Transports sit behind one interface, so nothing above it cares which is connected. `internal/transport/serial` and `internal/transport/ble` each implement that interface, and nothing above them changes when you switch link. The virtual light implements the interface too and prints to the terminal, so the whole system is testable without hardware.
 
 Adding another agent means adding a package under `internal/adapter/`. Nothing else changes, and agents that can post directly need no adapter at all.
 
@@ -519,7 +512,7 @@ Full detail in [design.md](design.md).
 | `stoplight install` | Hook entries, service, and start it. The only setup step. |
 | `stoplight uninstall` | Remove the hooks and the service |
 | `stoplight` | Run the relay in the foreground. For development. |
-| `stoplight status` | Service state, connection, current sessions |
+| `stoplight status` | Service state, light connection, session count and aggregate |
 | `stoplight restart` | Bounce the service |
 | `stoplight logs` | Tail the log |
 | `stoplight service stop` | Stop until next login |
@@ -535,10 +528,12 @@ Flags on the bare relay command:
 |---|---|
 | `--virtual` | Use the virtual light instead of hardware |
 | `--serial <path>` | Use a specific serial device instead of auto-discovering one |
+| `--ble` | Use a Bluetooth light instead of a USB one |
+| `--ble-name <name>` | Connect to one named Bluetooth light. Implies `--ble`. |
 | `--addr <host:port>` | HTTP listen address, default `127.0.0.1:7373` |
 | `--timeout <duration>` | Session silence timeout, default `30m` |
 
-`--virtual` and `--serial` are mutually exclusive. With neither, the relay looks for a serial light and falls back to the virtual one, saying so, because a silent fallback looks exactly like broken hardware. `status` and `task` take `--addr` too, for a relay on a non-default port.
+The transport flags `--virtual`, `--serial` and `--ble` are mutually exclusive. With none of them, the relay looks for a serial light, then a Bluetooth light, then falls back to the virtual one, saying so each step, because a silent fallback looks exactly like broken hardware. `status` and `task` take `--addr` too, for a relay on a non-default port.
 
 ## Build it
 
