@@ -89,17 +89,28 @@ func (l *limitedReader) Read(p []byte) (int, error) {
 // listenSocket binds the unix socket at path, creating parent directories and
 // removing a stale socket file left by a previous run.
 //
-// Removing the stale file is safe because a live relay holds the path open and
-// would have failed to bind; a file left behind is by definition from a
-// process that is gone.
+// A unix bind FAILS on any pre-existing socket file, live or stale, so the only
+// way to recover a crashed run's leftover path is to unlink it first. The
+// hazard is that an unconditional unlink does not distinguish the two cases: it
+// would delete the inode a live relay is still serving. The deletion does not
+// stop that relay, which keeps accepting on the now-unlinked inode and never
+// sees another producer, so a second relay started on the same path with a
+// different HTTP address silently takes over ingest with no error on either
+// side.
+//
+// So probe the path before touching it: dial it, and remove it only when the
+// dial is refused. A refused connection on an existing socket file means no
+// process is listening, which is exactly a stale path. A dial that connects
+// means a live relay owns it, and listenSocket refuses rather than clobbering
+// it.
 func listenSocket(path string) (net.Listener, error) {
 	if dir := filepath.Dir(path); dir != "" {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			return nil, fmt.Errorf("relay: create socket directory: %w", err)
 		}
 	}
-	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return nil, fmt.Errorf("relay: remove stale socket: %w", err)
+	if err := removeStaleSocket(path); err != nil {
+		return nil, err
 	}
 
 	listener, err := net.Listen("unix", path)
@@ -113,6 +124,48 @@ func listenSocket(path string) (net.Listener, error) {
 		return nil, fmt.Errorf("relay: chmod socket: %w", err)
 	}
 	return listener, nil
+}
+
+// socketDialTimeout bounds the liveness probe in removeStaleSocket. The dial is
+// to a local unix path, so a live listener answers at once; this cap only stops
+// a pathological path from stalling startup.
+const socketDialTimeout = time.Second
+
+// removeStaleSocket unlinks path only when it is a stale socket file. It leaves
+// the path alone when nothing is there, and refuses when a live listener owns
+// it.
+//
+// The liveness test is a dial. A connection that is refused on an existing
+// socket file means the kernel has no listener for it, which is a stale path a
+// crash left behind, so it is removed. A connection that succeeds means a relay
+// is serving the path, so removing it would steal a live socket and this returns
+// an error instead.
+//
+// A path that is not a socket (a regular file a crash left, or anything else)
+// cannot be dialed as one, so it falls through to the unlink too: a non-socket
+// at the path would make the bind fail just the same, and removing it is the
+// only way forward.
+func removeStaleSocket(path string) error {
+	if _, err := os.Lstat(path); err != nil {
+		// Nothing at the path, or it cannot be examined. ErrNotExist is the
+		// common clean start; any other stat error will resurface from the bind
+		// below with more context, so do not pre-empt it here.
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return nil
+	}
+
+	conn, err := net.DialTimeout("unix", path, socketDialTimeout)
+	if err == nil {
+		conn.Close()
+		return fmt.Errorf("relay: socket %s is in use by a live relay", path)
+	}
+
+	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("relay: remove stale socket: %w", err)
+	}
+	return nil
 }
 
 // serveSocket accepts connections until ctx is cancelled or the listener is
