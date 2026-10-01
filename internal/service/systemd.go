@@ -192,6 +192,16 @@ func (s *systemd) Install(binPath string, relayArgs ...string) error {
 	if out, err := s.run("systemctl", "--user", "enable", systemdUnit); err != nil {
 		return fmt.Errorf("systemctl --user enable %s: %w: %s", systemdUnit, err, strings.TrimSpace(string(out)))
 	}
+	// Adopt the rewritten unit on a reinstall. systemd keeps the old process
+	// running until the unit is restarted, so a plain `start` later is a
+	// no-op on an active unit and the relay would keep the previous transport
+	// until the next login. try-restart restarts the unit only when it is
+	// already active, and is a no-op otherwise, so a reinstall over a running
+	// relay picks up the new ExecStart while a stopped relay stays stopped.
+	// This mirrors launchd, where Install boots the agent out and back in.
+	if out, err := s.run("systemctl", "--user", "try-restart", systemdUnit); err != nil {
+		return fmt.Errorf("systemctl --user try-restart %s: %w: %s", systemdUnit, err, strings.TrimSpace(string(out)))
+	}
 	return nil
 }
 

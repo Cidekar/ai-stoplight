@@ -56,7 +56,7 @@ func TestSystemdInstallRefusesAForeignUnit(t *testing.T) {
 
 // TestSystemdUninstallRefusesAForeignUnit covers the deletion case.
 func TestSystemdUninstallRefusesAForeignUnit(t *testing.T) {
-	s, _ := newTestSystemd(t)
+	s, rec := newTestSystemd(t)
 	if err := os.WriteFile(s.unitPath, []byte(foreignUnit), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -70,6 +70,12 @@ func TestSystemdUninstallRefusesAForeignUnit(t *testing.T) {
 	}
 	if _, serr := os.Stat(s.unitPath); serr != nil {
 		t.Errorf("the foreign unit was deleted: %v", serr)
+	}
+	// The ownership check comes before any stop, so a refusal must leave the
+	// foreign service running rather than halting a service we then decline to
+	// remove.
+	if rec.ran("systemctl", "--user", "stop") {
+		t.Errorf("a foreign unit was stopped before the refusal, calls: %+v", rec.calls)
 	}
 }
 
