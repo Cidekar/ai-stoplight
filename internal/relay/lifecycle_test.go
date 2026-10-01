@@ -155,6 +155,13 @@ type droppingTransport struct {
 	// failNextSend makes the next Send fail and disconnect, once.
 	failNextSend bool
 
+	// failNextSendKeepConnected makes the next Send fail once while leaving the
+	// link up. It is the transport contract's "this frame was lost, not that
+	// the transport is dead" case, which a dropped handle does not model: there
+	// is no edge for the loop to see, so only an unacked-frame resend recovers
+	// it.
+	failNextSendKeepConnected bool
+
 	connects atomic.Int64
 	sends    atomic.Int64
 	closes   atomic.Int64
@@ -187,6 +194,12 @@ func (d *droppingTransport) Send(f stoplight.Frame) error {
 		d.connected = false
 		return errors.New("write to device failed")
 	}
+	if d.failNextSendKeepConnected {
+		// A transient write error that does not disconnect: the frame is lost
+		// but the link is still up.
+		d.failNextSendKeepConnected = false
+		return errors.New("transient write error")
+	}
 	if !d.connected {
 		return errors.New("not connected")
 	}
@@ -207,6 +220,12 @@ func (d *droppingTransport) setFailNextSend() {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	d.failNextSend = true
+}
+
+func (d *droppingTransport) setFailNextSendKeepConnected() {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.failNextSendKeepConnected = true
 }
 
 func (d *droppingTransport) setConnectErr(err error) {
@@ -314,6 +333,67 @@ func TestTransportReconnectsAfterFailedSend(t *testing.T) {
 	case <-time.After(10 * time.Second):
 		t.Fatal("Run did not return after cancel")
 	}
+}
+
+// A Send that fails while the link stays up loses the frame, and the relay
+// must resend it on its own. Before the fix a transient write error was logged
+// and forgotten: the lamp held the previous colour until the tracker next
+// moved, because the transport never disconnected and so no reconnect edge
+// pushed the frame again.
+func TestLostFrameIsResentWhileConnected(t *testing.T) {
+	tr := &droppingTransport{}
+	r := newFastReconnectRelay(t, tr)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- r.Run(ctx) }()
+	addr := waitForAddr(t, r)
+
+	waitFor(t, 5*time.Second, "initial connect", func() bool {
+		return tr.connects.Load() >= 1
+	})
+
+	// The next send fails but the link stays up, so there is no edge to notice.
+	tr.setFailNextSendKeepConnected()
+	if code := postSession(t, addr, `{"session_id":"a","event":"blocked","label":"auth"}`); code != 204 {
+		t.Fatalf("status = %d, want 204", code)
+	}
+
+	// Nothing else moves the tracker, so the red frame can only reach the light
+	// if the relay retries the lost one.
+	waitFor(t, 10*time.Second, "the lost frame to be resent", func() bool {
+		f, ok := tr.lastFrame()
+		return ok && f.Color == stoplight.ColorRed
+	})
+
+	cancel()
+	<-done
+}
+
+// After the first connect the relay must push the current frame once, even
+// though no state changed. Before the fix startConnect(retry=false) never
+// transmitted and the loop only resent on a disconnected-to-connected edge, so
+// a light that was already up at startup held its boot state until the first
+// ingest.
+func TestFirstFrameSentAfterStartupConnect(t *testing.T) {
+	tr := &droppingTransport{}
+	r := newFastReconnectRelay(t, tr)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- r.Run(ctx) }()
+	waitForAddr(t, r)
+
+	// No post, no state change: a frame still reaches the light because the
+	// first reconnect tick sees a connected transport that has not acked.
+	waitFor(t, 10*time.Second, "the startup frame to be sent", func() bool {
+		return tr.frameCount() >= 1
+	})
+
+	cancel()
+	<-done
 }
 
 // A reconnect that keeps failing must be logged and retried, never propagated.
