@@ -387,13 +387,18 @@ The relay does not poll, and this section does not make it a poller. A poller is
 
 Claude Code emits hooks on session events, so its adapter is a table and an installer. Any agent with a similar mechanism follows the same shape.
 
-| Claude Code hook | Protocol event |
-|---|---|
-| `SessionStart` | `idle` |
-| `UserPromptSubmit` | `started` |
-| `Notification` | `blocked` |
-| `Stop` | `finished` |
-| `SessionEnd` | `ended` |
+| Claude Code hook | Matcher | Protocol event |
+|---|---|---|
+| `SessionStart` | `startup` | `idle` |
+| `UserPromptSubmit` | | `started` |
+| `PreToolUse` | | `started` |
+| `Notification` | `permission_prompt` | `blocked` |
+| `Stop` | | `finished` |
+| `SessionEnd` | | `ended` |
+
+The matcher narrows a hook to the one sub-event that means the mapped protocol event; a blank matcher means every occurrence. Two hooks need one. `SessionStart` fires on `startup`, `resume`, `clear`, `fork` and `compact`, but only `startup` is a session sitting idle: an auto-compaction mid-turn would otherwise drop a working session to idle until the next `Stop`. `Notification` fires on every notification type, and only `permission_prompt` means a human is needed: `idle_prompt` fires about a minute after a turn ends, and matching it would turn a green session red.
+
+`PreToolUse` carries no colour of its own; it reports `started` to clear `blocked`. When a human approves a permission prompt the agent runs the tool, and `PreToolUse` fires long before `Stop`. Without it nothing between the `Notification` and the `Stop` sends an event, so an approved prompt stays red for the rest of the turn. `started` from `blocked` returns the session to working, which is where it is. The poll table agrees: a running session reports `working`, which is also `started`.
 
 `SessionEnd` is what makes a session leave. Without it the only removal paths are an explicit `ended` from some other producer and the silence timeout, and a session that keeps emitting events is never silent: a background agent that reports `blocked` every few minutes refreshes its own keepalive and holds the lamp red indefinitely. `SessionEnd` fires on `exit`, on Ctrl-D and on abnormal termination, so the session that a human has closed is the session that leaves the light.
 
