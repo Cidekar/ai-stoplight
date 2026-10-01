@@ -380,6 +380,56 @@ func TestEndedForUnknownSessionDoesNotDisturbOthers(t *testing.T) {
 	}
 }
 
+// A session that falls silent and expires must not linger as a zombie that
+// swallows its own next event. An `ended` for an unknown session takes an early
+// exit that used to run before expired sessions were dropped, which left the
+// just-expired "a" marked but still in the map. Its next report found it, Next
+// on Expired is a terminal no-op, and the `blocked` was lost with the lamp off.
+// Expiry now removes the session, so the report recreates it fresh and red.
+func TestExpiredSessionDoesNotSwallowItsNextEvent(t *testing.T) {
+	tracker := NewTracker(testTimeout)
+	tracker.Apply(Report{SessionID: "a", Event: "started", Provider: "cc"}, base)
+
+	// An `ended` for a session the relay never saw. It expires the silent "a",
+	// then takes the early exit for an unknown `ended`.
+	tracker.Apply(Report{SessionID: "never", Event: "ended", Provider: "cc"},
+		base.Add(testTimeout+time.Minute))
+
+	// "a" reports blocked one second later. It must be a fresh red session.
+	tracker.Apply(Report{SessionID: "a", Event: "blocked", Provider: "cc"},
+		base.Add(testTimeout+time.Minute+time.Second))
+
+	if got := tracker.Aggregate(); got != ColorRed {
+		t.Errorf("Aggregate() = %v, want red: the blocked event was swallowed by a zombie", got)
+	}
+	sessions := tracker.Sessions()
+	if len(sessions) != 1 || sessions[0].State != StateBlocked {
+		t.Errorf("Sessions() = %+v, want one fresh blocked session", sessions)
+	}
+}
+
+// The same zombie reached through SetOverride for an unknown session, which also
+// expires the silent set and then takes an early exit. The just-expired "a"
+// must not linger to swallow its next report.
+func TestSetOverrideDoesNotLeaveAZombie(t *testing.T) {
+	tracker := NewTracker(testTimeout)
+	tracker.Apply(Report{SessionID: "a", Event: "started", Provider: "cc"}, base)
+
+	// Naming a task the relay has never seen parks the label and exits early.
+	tracker.SetOverride("someone-else", "label", base.Add(testTimeout+time.Minute))
+
+	tracker.Apply(Report{SessionID: "a", Event: "blocked", Provider: "cc"},
+		base.Add(testTimeout+time.Minute+time.Second))
+
+	if got := tracker.Aggregate(); got != ColorRed {
+		t.Errorf("Aggregate() = %v, want red: the blocked event was swallowed by a zombie", got)
+	}
+	sessions := tracker.Sessions()
+	if len(sessions) != 1 || sessions[0].State != StateBlocked {
+		t.Errorf("Sessions() = %+v, want one fresh blocked session", sessions)
+	}
+}
+
 // An idle session that hits a permission prompt with no intervening `started`
 // still turns the lamp red.
 func TestBlockedFromIdleTurnsRed(t *testing.T) {

@@ -393,10 +393,20 @@ func (t *Tracker) Sweep(now time.Time) (changed bool) {
 	return t.commitLocked()
 }
 
-// expireSilentLocked marks every session silent for longer than the timeout as
-// expired. exempt names a session to skip, which is the one currently
-// reporting: its report is its keepalive, so it must not be expired by the
-// silence that preceded it.
+// expireSilentLocked removes every session silent for longer than the timeout.
+// exempt names a session to skip, which is the one currently reporting: its
+// report is its keepalive, so it must not be expired by the silence that
+// preceded it.
+//
+// A session is marked expired AND removed in one step, never left marked. An
+// Expired session that lingered in the map was a zombie: the next report for
+// its ID found it, and Next on StateExpired is a terminal no-op, so the event
+// was swallowed and the session dropped only afterwards. A `blocked` arriving
+// one tick after a silent session expired was lost, and the lamp stayed off.
+// Removing here instead means the next report for that ID always creates a
+// fresh session via InitialState, which is the restart the state machine
+// already intends. It also makes the invariant the whole design rests on true:
+// no event ever arrives at an Expired session, because none is ever kept.
 //
 // A non-positive timeout disables expiry by silence, leaving `ended` as the
 // only way out. Parked overrides age out on the same rule, so a name for work
@@ -410,7 +420,7 @@ func (t *Tracker) expireSilentLocked(now time.Time, exempt string) {
 			continue
 		}
 		if now.Sub(session.LastSeen) >= t.sessionTimeout {
-			session.State = StateExpired
+			delete(t.sessions, id)
 			t.dirty = true
 		}
 	}
