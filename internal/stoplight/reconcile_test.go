@@ -302,6 +302,31 @@ func TestReconcileHoldsTheAggregateInvariant(t *testing.T) {
 	}
 }
 
+// A sync that lands just after a session fell silent must still apply its entry
+// for that session. Reconcile expires the silent set before it folds entries in,
+// so a session that just timed out was marked expired and then met by its own
+// entry. Next on Expired is a terminal no-op, so a poll declaring the session
+// blocked was dropped for a full cycle and the lamp stayed off. Expiry now
+// removes the session, so the entry recreates it fresh and the lamp goes red.
+func TestReconcileAppliesEntryForAJustExpiredSession(t *testing.T) {
+	tracker := NewTracker(testTimeout)
+	tracker.Apply(withProvider(report("a", "blocked"), "cc"), base)
+
+	// A poll taken past the timeout, still declaring "a" blocked.
+	tracker.Reconcile(
+		syncOf("cc", testTimeout+time.Minute, report("a", "blocked")),
+		base.Add(testTimeout+time.Minute),
+	)
+
+	if got := tracker.Aggregate(); got != ColorRed {
+		t.Errorf("Aggregate() = %v, want red: the poll declared a blocked", got)
+	}
+	sessions := tracker.Sessions()
+	if len(sessions) != 1 || sessions[0].State != StateBlocked {
+		t.Errorf("Sessions() = %+v, want one fresh blocked session", sessions)
+	}
+}
+
 // A hook that says nothing about when it read the world must not erase a
 // poll's claim to have read it later, or every delta would reopen the door to
 // a stale sync.
