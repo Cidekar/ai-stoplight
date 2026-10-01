@@ -192,12 +192,15 @@ The distinction that carries the whole product is `blocked` versus `started`. Se
 
 The adapter maps Claude Code's hooks onto those events. This is the only place a vendor's vocabulary appears:
 
-| Claude Code hook | Event |
-|---|---|
-| `SessionStart` | `idle` |
-| `UserPromptSubmit` | `started` |
-| `Notification` | `blocked` |
-| `Stop` | `finished` |
+| Claude Code hook | Matcher | Event |
+|---|---|---|
+| `SessionStart` | `startup` | `idle` |
+| `UserPromptSubmit` | | `started` |
+| `PreToolUse` | | `started` |
+| `Notification` | `permission_prompt` | `blocked` |
+| `Stop` | | `finished` |
+
+The matcher keeps a hook to the sub-event that means the event. `SessionStart` fires on more than a fresh start, so it is pinned to `startup`, or an auto-compaction mid-turn would read as idle. `Notification` fires on more than a permission prompt, so it is pinned to `permission_prompt`, or a routine idle reminder would turn the light red. `PreToolUse` carries the `started` that clears `blocked`: after you approve a prompt the agent runs a tool, and this is what returns the session to working before the turn ends.
 
 Adding another agent is a new adapter, or no adapter at all if it can post directly. See [RFC 1 §10](rfc.md#10-adapters).
 
@@ -205,7 +208,7 @@ It also appends a line to a log file on every call. When the light does not resp
 
 #### Sessions already open are invisible until they next do something
 
-All four hooks are edge-triggered: they fire on a transition, never on a state. Nothing enumerates sessions, and the relay holds no address for a producer, so it cannot ask what is already running. A session that was open before the relay started has no pending transition to announce itself with, and the light does not know it exists.
+Every hook is edge-triggered: it fires on a transition, never on a state. Nothing enumerates sessions, and the relay holds no address for a producer, so it cannot ask what is already running. A session that was open before the relay started has no pending transition to announce itself with, and the light does not know it exists.
 
 **Nothing needs restarting.** Type anything in that window and `UserPromptSubmit` fires, the session registers, and it behaves normally from then on. The rule in practice: an idle old window is invisible until you touch it. A window you never touch again stays dark, which is the right answer anyway, because it is not telling you anything.
 

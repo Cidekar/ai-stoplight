@@ -349,6 +349,81 @@ func TestUninstallKeepsForeignGroupInSameEvent(t *testing.T) {
 	}
 }
 
+func TestUninstallRemovesOurMatchedGroups(t *testing.T) {
+	// Our own groups now carry a "matcher" sibling. Uninstall must still
+	// recognise and remove them: a group of ours left behind would hold the
+	// lamp forever. This is the regression guard on the ownership logic that
+	// used to key on a group having exactly one ("hooks") key.
+	path := write(t, `{"editorMode":"vim"}`)
+	a := newForPath(path)
+
+	if err := a.Install(testBin); err != nil {
+		t.Fatalf("Install: %v", err)
+	}
+	// Sanity: the matched hooks really were written.
+	if n := countOurs(t, path, "SessionStart"); n != 1 {
+		t.Fatalf("got %d SessionStart entries, want 1", n)
+	}
+	if n := countOurs(t, path, "Notification"); n != 1 {
+		t.Fatalf("got %d Notification entries, want 1", n)
+	}
+
+	if err := a.Uninstall(); err != nil {
+		t.Fatalf("Uninstall: %v", err)
+	}
+	// Not one of our entries may survive. A matched group left behind would
+	// still hold the lamp, and its marker would show here.
+	if got := read(t, path); strings.Contains(got, marker) {
+		t.Errorf("a Stoplight entry survived uninstall:\n%s", got)
+	}
+	if n := countOurs(t, path, "SessionStart"); n != 0 {
+		t.Errorf("got %d SessionStart entries after uninstall, want 0", n)
+	}
+}
+
+func TestInstallIntoForeignMatchedHookAddsOwnGroup(t *testing.T) {
+	// Another tool's PreToolUse group with its own matcher must survive, and
+	// our PreToolUse entry must go into a separate group so uninstall can
+	// remove ours without touching theirs. The fixture is pre-indented so
+	// the restored file compares byte-for-byte: save re-indents the whole
+	// document.
+	original := `{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "my-linter"
+          }
+        ]
+      }
+    ]
+  }
+}
+`
+	path := write(t, original)
+	a := newForPath(path)
+
+	if err := a.Install(testBin); err != nil {
+		t.Fatalf("Install: %v", err)
+	}
+	if n := countOurs(t, path, "PreToolUse"); n != 1 {
+		t.Fatalf("got %d PreToolUse entries of ours, want 1:\n%s", n, read(t, path))
+	}
+	if !strings.Contains(read(t, path), "my-linter") {
+		t.Errorf("the foreign PreToolUse hook was dropped:\n%s", read(t, path))
+	}
+
+	if err := a.Uninstall(); err != nil {
+		t.Fatalf("Uninstall: %v", err)
+	}
+	if got := read(t, path); got != original {
+		t.Errorf("uninstall did not restore the original:\nwant:\n%s\ngot:\n%s", original, got)
+	}
+}
+
 func TestUninstallIsIdempotent(t *testing.T) {
 	path := write(t, `{"editorMode":"vim"}`)
 	a := newForPath(path)
