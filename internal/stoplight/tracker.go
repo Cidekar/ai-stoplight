@@ -630,9 +630,14 @@ func (t *Tracker) frameLocked() Frame {
 	}
 
 	for i := range shown {
+		// Cap id and label to the firmware's per-field wire budget, not the
+		// relay's wider storage caps. SL_LINE_MAX is sized for these widths, so
+		// a frame built from them stays inside the device's line buffer. The
+		// stored values are untouched; only the copy on the wire is trimmed.
+		// See MaxFrameIDLen / MaxFrameLabelLen in report.go.
 		frame.Sessions = append(frame.Sessions, FrameSession{
-			ID:    shown[i].ID,
-			Label: shown[i].Display(),
+			ID:    truncate(shown[i].ID, MaxFrameIDLen),
+			Label: truncate(shown[i].Display(), MaxFrameLabelLen),
 			State: shown[i].State.Label(),
 			Color: shown[i].State.Color(),
 		})
