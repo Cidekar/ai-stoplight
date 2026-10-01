@@ -2,7 +2,10 @@ module github.com/cidekar/stoplight
 
 go 1.25.0
 
-require tinygo.org/x/bluetooth v0.16.0
+require (
+	golang.org/x/sys v0.11.0
+	tinygo.org/x/bluetooth v0.16.0
+)
 
 require (
 	github.com/go-ole/go-ole v1.2.6 // indirect
@@ -15,6 +18,5 @@ require (
 	github.com/tinygo-org/cbgo v0.0.4 // indirect
 	github.com/tinygo-org/pio v0.3.0 // indirect
 	golang.org/x/exp v0.0.0-20260727155853-b88d891fe743 // indirect
-	golang.org/x/sys v0.11.0 // indirect
 	tinygo.org/x/espradio v0.3.0 // indirect
 )

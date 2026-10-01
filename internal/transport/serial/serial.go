@@ -14,9 +14,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/cidekar/stoplight/internal/stoplight"
@@ -55,6 +55,23 @@ type Transport struct {
 	devicePath string
 	open       opener
 
+	// live is the connection state. It is an atomic rather than a field under
+	// mu so Connected never waits on an in-flight write: on darwin the Go
+	// runtime does not poll a character device, so a Write to a board that has
+	// stopped draining its CDC queue blocks in the kernel for as long as the
+	// board stays wedged. Connected answers the relay's once-a-second poll and
+	// `stoplight status`; neither may block behind a stuck frame.
+	live atomic.Bool
+
+	// writeMu serialises Send. It orders frames onto the one wire so two
+	// concurrent sends never interleave their bytes, and it is the lock a
+	// wedged Write holds. It is deliberately a different lock from mu: Connected
+	// and Close take mu, so a stuck write cannot block them.
+	writeMu sync.Mutex
+
+	// mu guards port and closed, the fields Connect, Close and the Send
+	// disconnect path all touch. It is held only for the moment it takes to
+	// read or swap the handle, never across a write.
 	mu     sync.Mutex
 	port   io.ReadWriteCloser
 	closed bool
@@ -73,11 +90,6 @@ func New(devicePath string) *Transport {
 // writer they control; production code calls New.
 func newWithOpener(devicePath string, open opener) *Transport {
 	return &Transport{devicePath: devicePath, open: open}
-}
-
-// openDevice is the real open: a CDC-ACM device is an ordinary file.
-func openDevice(devicePath string) (io.ReadWriteCloser, error) {
-	return os.OpenFile(devicePath, os.O_RDWR, 0)
 }
 
 // Discover lists the serial devices that could be a light. It returns the
@@ -155,6 +167,7 @@ func (t *Transport) tryOpen() error {
 		return fmt.Errorf("serial: open %s: %w", t.devicePath, err)
 	}
 	t.port = port
+	t.live.Store(true)
 	return nil
 }
 
@@ -170,17 +183,28 @@ func (t *Transport) Send(f stoplight.Frame) error {
 		return fmt.Errorf("serial: encode frame: %w", err)
 	}
 
-	t.mu.Lock()
-	defer t.mu.Unlock()
+	// writeMu orders frames onto the wire. It is the lock a wedged Write holds,
+	// and it is held across the Write below, but Connected and Close take mu
+	// instead, so a stuck write cannot block them.
+	t.writeMu.Lock()
+	defer t.writeMu.Unlock()
 
+	// Snapshot the handle under mu, then release mu before writing. The Write
+	// runs with mu free, which is the whole point: on a board that has stopped
+	// draining its CDC queue the Write blocks in the kernel with no deadline,
+	// and holding mu across it would wedge Connected and Close too.
+	t.mu.Lock()
 	if t.closed {
+		t.mu.Unlock()
 		return errClosed
 	}
-	if t.port == nil {
+	port := t.port
+	t.mu.Unlock()
+	if port == nil {
 		return fmt.Errorf("serial: not connected to %s", t.devicePath)
 	}
 
-	n, err := t.port.Write(data)
+	n, err := port.Write(data)
 	if err == nil && n < len(data) {
 		// A short write with no error truncates the frame, and the firmware
 		// splits on the newline that never arrived, so the next frame merges
@@ -189,19 +213,30 @@ func (t *Transport) Send(f stoplight.Frame) error {
 	}
 	if err != nil {
 		// Unplugging the device makes every later write fail. Drop the handle
-		// so Connected reports the truth and Connect can reopen it.
-		t.port.Close()
-		t.port = nil
+		// so Connected reports the truth and Connect can reopen it. Clear only
+		// the handle we just wrote to: a Close or a reconnect may have swapped
+		// in a new port while this write was in flight, and that one must stand.
+		t.mu.Lock()
+		if t.port == port {
+			t.port = nil
+			t.live.Store(false)
+		}
+		t.mu.Unlock()
+		port.Close()
 		return fmt.Errorf("serial: write to %s: %w", t.devicePath, err)
 	}
 	return nil
 }
 
 // Connected reports whether the port is currently open.
+//
+// It reads an atomic rather than taking mu, on purpose. Send can block in a
+// wedged Write for as long as the board stays stuck; if this took the lock
+// Send's disconnect path takes, the relay's connection poll and `stoplight
+// status` would both block behind that stuck frame. The BLE transport documents
+// the same reasoning.
 func (t *Transport) Connected() bool {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	return t.port != nil
+	return t.live.Load()
 }
 
 // Close releases the port. It is idempotent: closing twice is not an error,
@@ -211,6 +246,7 @@ func (t *Transport) Close() error {
 	defer t.mu.Unlock()
 
 	t.closed = true
+	t.live.Store(false)
 	if t.port == nil {
 		return nil
 	}
