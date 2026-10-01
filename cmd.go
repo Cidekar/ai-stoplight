@@ -175,6 +175,18 @@ func cmdRelay(args []string, stdout, stderr io.Writer) int {
 		return code
 	}
 
+	// The relay takes no positional arguments, so any that survive parsing are a
+	// mistake worth stopping for. A quoting bug in a service definition is the
+	// way these appear in practice: a value such as --ble-name "Stoplight A4"
+	// that reached the command line unquoted leaves "A4" here, and the flag
+	// parser already took the name as "Stoplight". Failing loudly turns a light
+	// that silently connects to the wrong name into a usage error that names the
+	// stray argument.
+	if extra := fs.Args(); len(extra) > 0 {
+		fmt.Fprintf(stderr, "stoplight: unexpected argument %q\n", extra[0])
+		return exitUsage
+	}
+
 	// The address is checked before a transport is chosen, because choosing one
 	// is the expensive, side-effecting step: it globs for serial devices and,
 	// finding none, scans the airwaves for several seconds. A malformed --addr
@@ -307,9 +319,19 @@ func (c transportChoice) relayArgs() []string {
 	return nil
 }
 
-// validate rejects flag combinations that ask for two different lights. Each
-// message names both flags, because a message that names one leaves the reader
+// validate rejects a choice the relay cannot act on. Each conflict message
+// names both flags, because a message that names one leaves the reader
 // guessing which of the two to drop.
+//
+// The ble-name check is the one install can reach: install sets only the two
+// Bluetooth flags, so without it validate's every branch needed virtual or
+// serial and the call install makes could never fail. A name that begins with
+// a dash is the reachable failure. install bakes --ble-name <name> into the
+// service definition, and the service reads those tokens back through this
+// same flag parser at every login; a name like "-x" is taken there as a flag,
+// not a value, so the service starts on the wrong light or not at all.
+// Refusing it here turns a silent misinstall into a usage error at install
+// time, where the user is still watching.
 func (c transportChoice) validate() error {
 	switch {
 	case c.virtual && c.device != "":
@@ -318,6 +340,8 @@ func (c transportChoice) validate() error {
 		return errors.New("--virtual and --ble cannot both be set")
 	case c.device != "" && (c.ble || c.bleName != ""):
 		return errors.New("--serial and --ble cannot both be set")
+	case strings.HasPrefix(c.bleName, "-"):
+		return fmt.Errorf("--ble-name %q cannot begin with a dash: the service reads it back as a flag", c.bleName)
 	}
 	return nil
 }

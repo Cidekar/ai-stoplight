@@ -451,6 +451,35 @@ func TestBareCommandRejectsConflictingTransports(t *testing.T) {
 	}
 }
 
+// TestBareCommandRejectsAPositionalArgument proves the relay refuses a stray
+// argument rather than ignoring it. This is the symptom of a service definition
+// that quoted a value wrongly: --ble-name "Stoplight A4" split in the command
+// line leaves "A4" here, and the flag parser already took the name as
+// "Stoplight". A silent drop connects the service to the wrong light.
+func TestBareCommandRejectsAPositionalArgument(t *testing.T) {
+	code, _, stderr := runCLI("--virtual", "A4")
+	if code != exitUsage {
+		t.Errorf("exit code = %d, want %d", code, exitUsage)
+	}
+	if !strings.Contains(stderr, "A4") {
+		t.Errorf("stderr does not name the stray argument:\n%s", stderr)
+	}
+}
+
+// TestInstallRejectsADashLeadingBLEName proves install's flag validation can
+// fail. install sets only the Bluetooth flags, so the validate call it makes
+// used to be dead. A name that begins with a dash is read back as a flag at
+// service start, so install stops before writing anything.
+func TestInstallRejectsADashLeadingBLEName(t *testing.T) {
+	code, _, stderr := runCLI("install", "--ble-name=-x")
+	if code != exitUsage {
+		t.Errorf("exit code = %d, want %d", code, exitUsage)
+	}
+	if !strings.Contains(stderr, "--ble-name") {
+		t.Errorf("stderr does not name the flag:\n%s", stderr)
+	}
+}
+
 // TestBareCommandRejectsABadFlag proves an unknown flag on the relay is a
 // usage error, unlike on notify where it must be tolerated.
 func TestBareCommandRejectsABadFlag(t *testing.T) {
