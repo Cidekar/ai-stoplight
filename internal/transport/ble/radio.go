@@ -36,16 +36,54 @@ func mustParseUUID(s string) bt.UUID {
 	return u
 }
 
-// enableOnce guards adapter setup. bluetooth.DefaultAdapter is a process-wide
+// enableMu guards adapter setup. bluetooth.DefaultAdapter is a process-wide
 // singleton and its Enable is not safe to call twice concurrently: the darwin
 // backend rejects a second call outright with "already calling Enable
-// function". The result is cached because the answer does not change within a
-// process, except for a first-run permission prompt, which resolves before the
-// first Enable returns.
+// function". The mutex serialises the call, and enableState caches only the
+// answers that cannot change within a process.
+//
+// A sync.Once was wrong here. It cached every answer for the life of the
+// process, including the two that are not permanent: the radio switched off,
+// and a first Enable that timed out waiting for CoreBluetooth. The relay runs
+// as a login item (stoplight install --ble) and starts while Bluetooth is off,
+// or before the user has answered the one-time permission prompt; the Once then
+// pinned "unavailable" forever and the light was never found until the relay
+// was restarted. That contradicted ErrUnavailable's own promise -- "worth
+// retrying, because switching Bluetooth on fixes it" -- so only the terminal
+// answers are kept and a retryable one is returned without being cached.
 var (
-	enableOnce sync.Once
-	enableErr  error
+	enableMu    sync.Mutex
+	enableState struct {
+		// done is set once a terminal answer is reached: Enable succeeded, or
+		// it was refused by permission. Both are fixed for the process, so a
+		// later call returns err without touching the radio again.
+		done bool
+		err  error
+	}
 )
+
+// adapterEnabler is the library call enableAdapter drives, pulled out as a
+// variable so the retry-and-cache logic can be tested without a radio: the
+// transient-error path that matters here cannot be provoked from a test that
+// needs real hardware to be absent one moment and present the next.
+var adapterEnabler = func() error { return bt.DefaultAdapter.Enable() }
+
+// swapEnabler replaces adapterEnabler for a test and returns a function that
+// restores it. It is here, in non-test code, only so the restore cannot be
+// forgotten; nothing in production calls it.
+func swapEnabler(fn func() error) (restore func()) {
+	prev := adapterEnabler
+	adapterEnabler = fn
+	return func() { adapterEnabler = prev }
+}
+
+// resetAdapterState clears the cached enable result for a test.
+func resetAdapterState() {
+	enableMu.Lock()
+	defer enableMu.Unlock()
+	enableState.done = false
+	enableState.err = nil
+}
 
 // scanMu serialises whole scans against each other, for the same reason
 // enableOnce serialises Enable: DefaultAdapter is process-wide state.
@@ -71,8 +109,9 @@ var (
 // context.
 var scanMu sync.Mutex
 
-// enableAdapter powers up the host adapter, at most once per process, and
-// returns as soon as ctx is done even if the adapter has not answered.
+// enableAdapter powers up the host adapter and returns as soon as ctx is done
+// even if the adapter has not answered. It calls the library's Enable once per
+// process on success or a permission refusal, and again on anything retryable.
 //
 // The library's Enable takes no context and blocks for up to ten seconds
 // waiting for CoreBluetooth to report a state. That wait is not hypothetical:
@@ -81,21 +120,41 @@ var scanMu sync.Mutex
 // far longer than the three the CLI allows for auto-discovery, so the wait
 // happens on a goroutine and the caller leaves when its own deadline passes.
 //
-// The abandoned goroutine finishes on its own and the sync.Once still records
-// the result, so a later call gets the real answer rather than repeating the
-// wait.
+// The abandoned goroutine finishes on its own and records the result under
+// enableMu, so a later call gets the real answer rather than repeating the
+// wait. A retryable result is handed back but not kept, so once the radio is
+// switched on or the slow stack finally answers, the next pass calls Enable
+// again instead of serving a stale "unavailable".
 func enableAdapter(ctx context.Context) error {
-	done := make(chan struct{})
+	enableMu.Lock()
+	if enableState.done {
+		err := enableState.err
+		enableMu.Unlock()
+		return err
+	}
+
+	done := make(chan error, 1)
 	go func() {
-		defer close(done)
-		enableOnce.Do(func() {
-			enableErr = classifyAdapterError(bt.DefaultAdapter.Enable())
-		})
+		// enableMu is held across the whole library call, not just the state
+		// write, so a second caller cannot start a concurrent Enable the darwin
+		// backend would reject. The caller below may leave on its deadline
+		// first, but the lock stays held until this goroutine finishes, which is
+		// what serialises the next attempt behind this one.
+		defer enableMu.Unlock()
+		err := classifyAdapterError(adapterEnabler())
+		// Keep only the terminal answers. A retryable error (the radio off, a
+		// slow stack, or an unrecognised string) is returned to this caller but
+		// left uncached so the next call retries Enable.
+		if err == nil || errors.Is(err, ErrPermissionDenied) {
+			enableState.done = true
+			enableState.err = err
+		}
+		done <- err
 	}()
 
 	select {
-	case <-done:
-		return enableErr
+	case err := <-done:
+		return err
 	case <-ctx.Done():
 		// Not a permission refusal and not a missing adapter: this is simply
 		// "no answer yet". Reporting it as retryable is what lets Connect try
