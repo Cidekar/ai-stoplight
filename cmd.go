@@ -593,11 +593,13 @@ func cmdUninstall(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "stoplight: %v\n", err)
 		failed = true
 	} else {
-		// A service that is already stopped is the state we want, so a stop
-		// error is reported but does not fail the command.
-		if err := mgr.Stop(); err != nil {
-			fmt.Fprintf(stderr, "stoplight: stop the service: %v\n", err)
-		}
+		// Uninstall stops the service itself, after its ownership check, so no
+		// separate Stop is needed here. A pre-check Stop would act on the
+		// definition's name before Uninstall decided whether the definition is
+		// ours: a foreign service installed under the same name would be
+		// stopped and then, correctly, not removed, leaving the user's own
+		// service halted. Letting Uninstall own the whole sequence keeps the
+		// ownership check in front of the stop on every platform.
 		if err := mgr.Uninstall(); err != nil {
 			fmt.Fprintf(stderr, "stoplight: remove the service: %v\n", err)
 			failed = true

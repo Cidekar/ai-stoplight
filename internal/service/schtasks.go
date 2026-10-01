@@ -63,8 +63,27 @@ func createArgs(binPath string, relayArgs ...string) []string {
 
 // Install registers the logon task, replacing any previous version.
 func (s *schtasks) Install(binPath string, relayArgs ...string) error {
+	// A running instance has to be adopted on a reinstall. /Create /F
+	// overwrites the task definition but leaves the already-running process
+	// alive on the old command line, and schtasks has no restart, so a plain
+	// /Run later is a no-op while that process is up: the relay would keep the
+	// previous transport until the next logon. Note whether it was running
+	// before the overwrite so a running relay can be relaunched below, while a
+	// stopped one stays stopped. This mirrors launchd and systemd, where
+	// Install replaces a running service in place.
+	wasRunning, _ := s.Running()
 	if out, err := s.run("schtasks", createArgs(binPath, relayArgs...)...); err != nil {
 		return fmt.Errorf("schtasks /Create %s: %w: %s", taskName, err, strings.TrimSpace(string(out)))
+	}
+	if wasRunning {
+		// End the stale process, then start the task again so it runs the new
+		// definition. Stop tolerates a task that already ended on its own.
+		if err := s.Stop(); err != nil {
+			return err
+		}
+		if out, err := s.run("schtasks", "/Run", "/TN", taskName); err != nil {
+			return fmt.Errorf("schtasks /Run %s: %w: %s", taskName, err, strings.TrimSpace(string(out)))
+		}
 	}
 	return nil
 }
