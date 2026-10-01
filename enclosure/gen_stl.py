@@ -201,9 +201,10 @@ def body():
     add = [Box(0, 0, 0, OUTER_W, OUTER_D, OUTER_H)]
     sub = []
 
-    # Main cavity, open at the back.
-    sub.append(Box(WALL, WALL, TOP_WALL,
-                   OUTER_W - WALL, OUTER_D + 1, OUTER_H - WALL))
+    # Main cavity, open at the back. The thick TOP_WALL lands under the button
+    # at the top face; the base keeps the plain WALL.
+    sub.append(Box(WALL, WALL, WALL,
+                   OUTER_W - WALL, OUTER_D + 1, OUTER_H - TOP_WALL))
 
     # Lamp bores and LED holes, centred within the lamp section so the top
     # bore clears the button pocket and the bottom clears the screen.

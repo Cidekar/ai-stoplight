@@ -135,8 +135,9 @@ module body() {
         // Outer shell.
         cube([outer_w, outer_d, outer_h]);
 
-        // Main cavity, open at the back.
-        translate([wall, wall, top_wall])
+        // Main cavity, open at the back. The thick top_wall lands under the
+        // button at the top face; the base keeps the plain wall.
+        translate([wall, wall, wall])
             cube([inner_w, inner_d + wall, outer_h - top_wall - wall]);
 
         // Three lamp bores, centred in the lamp section so the top bore
