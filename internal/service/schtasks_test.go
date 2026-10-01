@@ -79,6 +79,44 @@ func TestSchtasksCreateArgs(t *testing.T) {
 	}
 }
 
+func TestSchtasksCreateArgsQuotesRelayArgs(t *testing.T) {
+	// A BLE name with a space is the normal case. It must survive as one
+	// argument when the relay reads the /TR string back, not split into a
+	// name plus a stray positional that the flag parser drops.
+	args := createArgs(`C:\stoplight.exe`, "--ble-name", "Stoplight A4")
+
+	var tr string
+	for i, a := range args {
+		if a == "/TR" && i+1 < len(args) {
+			tr = args[i+1]
+		}
+	}
+	if tr == "" {
+		t.Fatalf("no /TR value in %v", args)
+	}
+
+	got := splitCommandLine(tr)
+	want := []string{`C:\stoplight.exe`, "relay", "--ble-name", "Stoplight A4"}
+	if !slices.Equal(got, want) {
+		t.Errorf("the /TR string did not round-trip: got %#v, want %#v (tr=%q)", got, want, tr)
+	}
+}
+
+func TestSchtasksInstallRejectsAnUnrepresentableArg(t *testing.T) {
+	// A quote inside a value would change where the splitter breaks the next
+	// argument, and a newline cannot appear in a task command at all. Both
+	// are refused before any task is registered.
+	for _, bad := range []string{`a"b`, "a\nb", "a\rb"} {
+		s, rec := newTestSchtasks()
+		if err := s.Install(`C:\stoplight.exe`, "--ble-name", bad); err == nil {
+			t.Errorf("Install accepted the unrepresentable name %q", bad)
+		}
+		if rec.ran("schtasks", "/Create") {
+			t.Errorf("Install ran schtasks for the unrepresentable name %q", bad)
+		}
+	}
+}
+
 func TestSchtasksCreateIsNotElevated(t *testing.T) {
 	// /RL HIGHEST would prompt for elevation and gain nothing.
 	joined := strings.Join(createArgs(`C:\stoplight.exe`), " ")

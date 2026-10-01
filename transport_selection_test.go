@@ -105,6 +105,20 @@ func TestSelectTransportRejectsConflictingFlags(t *testing.T) {
 	}
 }
 
+// TestValidateRejectsADashLeadingBLEName proves the check install relies on can
+// actually fail. install sets only the Bluetooth flags, so a validate that never
+// fired on those was dead. A name beginning with a dash is read back as a flag
+// by the service's own parser at every login, so it is refused at install time.
+func TestValidateRejectsADashLeadingBLEName(t *testing.T) {
+	err := transportChoice{bleName: "-x"}.validate()
+	if err == nil {
+		t.Fatal("validate accepted a ble name that begins with a dash")
+	}
+	if !strings.Contains(err.Error(), "--ble-name") {
+		t.Errorf("the error does not name the flag: %v", err)
+	}
+}
+
 // TestSelectTransportBLEDoesNotFallBack proves --ble is a decision rather than
 // a hint. The transport retries forever, so a light switched on later is still
 // found; silently handing back a serial or virtual light instead would hide
