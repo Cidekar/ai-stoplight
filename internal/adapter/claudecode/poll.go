@@ -77,11 +77,20 @@ const pollTimeout = 10 * time.Second
 // agentEntry is one session as `claude agents --json` reports it. Only the
 // fields this adapter maps are declared; the command emits more, and unknown
 // fields are ignored the way the rest of the protocol requires.
+//
+// Two fields describe liveness, and which one is present depends on the kind
+// of session. Background agents carry the rich `state` vocabulary from RFC 1
+// section 10.2 (working/blocked/done/…). Interactive sessions omit `state`
+// entirely and carry only `status` (busy/idle/waiting). A poller that read
+// `state` alone saw the empty string for every interactive session and fell
+// through to the unknown-state fallback, re-declaring each one as working on
+// every tick. Both are decoded, and `state` is preferred where present.
 type agentEntry struct {
 	SessionID string `json:"sessionId"`
 	Cwd       string `json:"cwd"`
 	Name      string `json:"name"`
 	State     string `json:"state"`
+	Status    string `json:"status"`
 }
 
 // Provider implements adapter.Poller.
@@ -121,12 +130,12 @@ func (a *Adapter) Poll(ctx context.Context) ([]stoplight.Report, time.Time, erro
 			// nothing the pin or a rotation slot could address.
 			continue
 		}
-		event, ok := eventForState(entry.State)
+		event, ok := eventForEntry(entry)
 		if !ok {
-			// A state this adapter does not know. Skipping the entry would
-			// declare the session absent and end it, so it is reported as
-			// working instead: an agent that exists and is doing something
-			// unrecognised is still an agent that exists.
+			// Neither field carried a value this adapter knows. Skipping the
+			// entry would declare the session absent and end it, so it is
+			// reported as working instead: an agent that exists and is doing
+			// something unrecognised is still an agent that exists.
 			event = "started"
 		}
 		reports = append(reports, stoplight.Report{
@@ -194,6 +203,49 @@ func eventForState(state string) (string, bool) {
 		// green, which is what "nothing needs you" looks like. The screen
 		// cannot show why a session ended and the lamp must not imply a
 		// human is needed when none is.
+		return "finished", true
+	default:
+		return "", false
+	}
+}
+
+// eventForEntry resolves one session's liveness to an RFC 1 event.
+//
+// `state` is preferred because it is the richer signal and the two fields can
+// disagree: a session observed blocked reports state="blocked" while its
+// status still reads "idle", and honouring status there would turn a red lamp
+// green. `status` is consulted only as a fallback, for the interactive
+// sessions that omit `state` entirely. An empty field is "not reported", not
+// an unknown value, so it simply defers to the next source rather than
+// counting as a state this adapter failed to recognise.
+func eventForEntry(entry agentEntry) (string, bool) {
+	if entry.State != "" {
+		if event, ok := eventForState(entry.State); ok {
+			return event, true
+		}
+	}
+	if entry.Status != "" {
+		if event, ok := eventForStatus(entry.Status); ok {
+			return event, true
+		}
+	}
+	return "", false
+}
+
+// eventForStatus maps an interactive session's `status` onto an RFC 1 event.
+//
+// This is the status half of the same table eventForState implements, and the
+// two must agree about what a colour means or a poll would fight the hooks it
+// is meant to correct. `busy` is work in progress; `waiting` is a session held
+// for a human, which is the blocked/red case, not a finished one; `idle` is a
+// session that wants nothing, which is green.
+func eventForStatus(status string) (string, bool) {
+	switch status {
+	case "busy":
+		return "started", true
+	case "waiting":
+		return "blocked", true
+	case "idle":
 		return "finished", true
 	default:
 		return "", false
