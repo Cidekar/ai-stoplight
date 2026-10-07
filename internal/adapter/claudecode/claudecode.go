@@ -85,17 +85,17 @@ type Adapter struct {
 	// settings file into being, which is the only thing that entitles
 	// Uninstall to delete it again.
 	//
-	// The flag lives for as long as the process does. `stoplight install`
-	// and `stoplight uninstall` are separate runs, so an uninstall from
-	// the command line always finds a file it cannot prove it created and
-	// leaves it in place, holding "{}". That is the intended bias: an
-	// empty file the user can delete beats deleting a file that was not
-	// ours, which no one can undo.
+	// Within one process Install sets it in memory. Across the separate
+	// `stoplight install` and `stoplight uninstall` runs it is restored from
+	// the record Install writes (see receipt.go), so a command-line uninstall
+	// removes a file it created rather than leaving a "{}" stub behind. A file
+	// the user or Claude Code created carries no record and is still kept: an
+	// empty file the user can delete beats deleting a file that was not ours,
+	// which no one can undo.
 	createdFile bool
 	// createdHooks records that this adapter's own Install added the
 	// top-level "hooks" key, which is likewise the only thing that lets
-	// Uninstall remove it again. Same lifetime and same bias as
-	// createdFile.
+	// Uninstall remove it again. Carried the same way as createdFile.
 	createdHooks bool
 	// createdEvents holds the event keys this adapter's own Install added
 	// to the hooks object. Only these may be deleted at uninstall.
@@ -103,7 +103,8 @@ type Adapter struct {
 	// An event the user left as an empty array is the case this exists
 	// for: Install appends to it, so after pruning it looks exactly like
 	// an event we introduced and emptied. Only a record taken before the
-	// edit can tell the two apart.
+	// edit can tell the two apart, which is why Install writes that record
+	// out for a later uninstall to read back.
 	createdEvents map[string]bool
 }
 
@@ -289,7 +290,15 @@ func (a *Adapter) Install(binPath string) error {
 		hooks.Set(m.Hook, append(groups, group))
 	}
 
-	return s.save(path)
+	if err := s.save(path); err != nil {
+		return err
+	}
+
+	// Record what this install created so an uninstall in a later process can
+	// prove the same ownership this one knows. Without it a command-line
+	// uninstall starts blank and leaves every emptied array, and a file it
+	// created, behind.
+	return a.saveReceipt()
 }
 
 // isBareGroup reports whether a group holds nothing but the keys Install
@@ -387,19 +396,29 @@ func (a *Adapter) Uninstall() error {
 	if err != nil {
 		return err
 	}
+
+	// Seed the created flags from the record Install left, so an uninstall in
+	// a fresh process knows what the installing process knew. A direct call on
+	// an adapter that did its own install already carries these in memory; the
+	// record only fills them in for a separate `stoplight uninstall` run, and
+	// a seeded value never contradicts one already set true.
+	if err := a.loadReceipt(); err != nil {
+		return err
+	}
+
 	s, err := loadSettings(path)
 	if err != nil {
 		return err
 	}
 	if !s.existed {
-		return nil
+		return a.removeReceipt()
 	}
 	hooks, err := s.hooksObject(false)
 	if err != nil {
 		return fmt.Errorf("%s: %w", path, err)
 	}
 	if hooks == nil {
-		return nil
+		return a.removeReceipt()
 	}
 
 	// The hooks key is removed only when this adapter added it, on the
@@ -457,7 +476,7 @@ func (a *Adapter) Uninstall() error {
 	}
 
 	if !changed {
-		return nil
+		return a.removeReceipt()
 	}
 
 	// Leave no empty scaffolding behind: a hooks object we emptied goes
@@ -466,28 +485,31 @@ func (a *Adapter) Uninstall() error {
 		s.root.Delete("hooks")
 	}
 
-	// Delete the file only when this adapter created it in this same run.
+	// Delete the file only when this adapter is the one that created it.
 	//
 	// An empty document is not permission to unlink. A settings.json that
 	// was already on disk, even one holding just "{}", was put there by
 	// the user or by Claude Code, and deleting it destroys whatever that
 	// was for. Such a file is written back as an empty object instead.
 	//
-	// a.createdFile is set only by an Install on this same adapter that
-	// found nothing at the path. A separate `stoplight uninstall` run
-	// starts with a fresh adapter, finds the file present, and therefore
-	// leaves it in place holding "{}" rather than guessing at who created
-	// it. Leaving an empty file is a cosmetic flaw the user can undo with
-	// one `rm`; deleting the wrong file is not recoverable.
+	// a.createdFile is true only when an Install found nothing at the path.
+	// Within one process it is set in memory; across the separate `stoplight
+	// install` and `stoplight uninstall` runs it is restored from the record
+	// that install left (see receipt.go), so a command-line uninstall now
+	// removes a file it created rather than leaving a "{}" stub behind. A file
+	// the user created carries no record and is still kept.
 	if s.root.Len() == 0 && a.createdFile {
 		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
 			return fmt.Errorf("remove %s: %w", path, err)
 		}
 		a.createdFile = false
-		return nil
+		return a.removeReceipt()
 	}
 
-	return s.save(path)
+	if err := s.save(path); err != nil {
+		return err
+	}
+	return a.removeReceipt()
 }
 
 // Installed reports whether any of this adapter's entries are present.
