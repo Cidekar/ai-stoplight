@@ -150,10 +150,19 @@ bool parseColor(const char* s, Color* out);
 
 // parseFrame parses one complete line of JSON into out.
 //
-// Returns false only when the line is unusable (empty, or not a JSON
-// object). It never returns false for an unrecognised field: those are
+// Returns false when the line is unusable: empty, not a JSON object, or
+// GARBLED. It never returns false for an unrecognised field: those are
 // skipped. A truncated frame that yielded something usable still returns
 // true, because showing most of a frame beats showing none of it.
+//
+// TRUNCATED and GARBLED are not the same. A frame cut short mid-token (the
+// link dropped before the newline) is salvageable: its keys are real, so it
+// returns true and the aggregate reaches the lamps. A frame GARBLED by two
+// frames being glued at a lost newline, {"color":"yellow","sess{"color":
+// "green",...}, is not: its structure breaks on a character the grammar
+// forbids rather than on the end of the line, its keys cannot be trusted, and
+// it returns false so the stale colour is not kept and the next clean frame is
+// awaited. See the note beside corrupt in parseFrame.
 bool parseFrame(const char* line, Frame* out);
 
 // findAggregateColor scans a possibly incomplete frame for the top level

@@ -924,6 +924,45 @@ void testTruncatedInputLeavesLampsAlone() {
     checkInt(d.sessionCount(), 0, "a complete empty list still clears");
   }
 
+  // A GLUED FRAME keeps no stale colour. When the link drops mid-frame the
+  // newline is lost, so the next frame's bytes append to the orphaned prefix
+  // and the reader hands parseFrame one garbled line. That line must be refused
+  // whole: reading its leading "color" as the aggregate kept the dropped
+  // frame's stale colour and lost the fresh one, which is the reported bug.
+  {
+    Frame glued;
+    // yellow dropped mid-"sessions"; green glued on after the lost newline.
+    check(!parseFrame("{\"color\":\"yellow\",\"sess{\"color\":\"green\","
+                      "\"sessions\":[]}",
+                      &glued),
+          "a truncated frame glued to the next one is refused, not kept stale");
+
+    // A key with no colon because a second object was glued on. Same shape,
+    // reached without a prior readable key.
+    Frame glued2;
+    check(!parseFrame("{\"ses{\"color\":\"red\"}", &glued2),
+          "a glued frame with no readable leading key is refused");
+
+    // The refusal is specific to GARBLE, not to a short line. A frame merely
+    // cut mid-token still parses and still surrenders its aggregate: the salvage
+    // the device depends on must not be lost to the fix above.
+    Frame cut;
+    check(parseFrame("{\"color\":\"red\",\"sess", &cut),
+          "a frame cut mid-key still parses");
+    check(cut.hasColor && cut.color == COLOR_RED,
+          "a cut frame still salvages its aggregate");
+
+    // Two legitimately back-to-back top level keys, the second value present and
+    // well formed, is VALID JSON and must still parse: the later "color" wins,
+    // exactly as the relay intends when it resends.
+    Frame valid;
+    check(parseFrame("{\"color\":\"yellow\",\"x\":5,\"color\":\"green\"}",
+                     &valid),
+          "a well formed frame with a repeated key still parses");
+    check(valid.hasColor && valid.color == COLOR_GREEN,
+          "and the later colour wins");
+  }
+
   // Non-JSON never reaches the display at all. parseFrame rejects anything
   // that is not an object, and the sketch only calls applyFrame on success,
   // so stray text on the wire cannot become content.
@@ -2423,18 +2462,28 @@ void testBleLink() {
     }
     checkInt(parsed, 0, "a truncated frame yields nothing");
 
-    // A whole frame follows. Its bytes join the orphaned prefix, so the
-    // first line is corrupt; the one after it is clean.
+    // A whole frame follows. Its bytes join the orphaned prefix, so the first
+    // line is garbled: the dropped prefix was {"color":"red","sess and the
+    // fresh frame glues on at its "color", so the corrupt line reads
+    // {"color":"red","sess{"color":"green"}. That line MUST be refused, not
+    // read as red: the stale colour the central dropped on must not survive
+    // the fresh green frame that follows it.
     std::string next = "{\"color\":\"green\"}\n{\"color\":\"yellow\"}\n";
     link.push((const uint8_t*)next.data(), (uint16_t)next.size());
     Color last = COLOR_OFF;
+    bool keptStaleRed = false;
     while (link.available() > 0) {
       int c = link.read();
       if (c < 0) break;
       if (rd.feed((char)c) && parseFrame(rd.line(), &f)) {
-        if (f.hasColor) last = f.color;
+        if (f.hasColor) {
+          if (f.color == COLOR_RED) keptStaleRed = true;
+          last = f.color;
+        }
       }
     }
+    check(!keptStaleRed,
+          "the glued line never surfaces the dropped frame's stale colour");
     check(last == COLOR_YELLOW,
           "the reader recovers on the frame after a truncation");
   }
