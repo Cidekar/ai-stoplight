@@ -2,11 +2,21 @@ package claudecode
 
 import (
 	"context"
+	_ "embed"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 )
+
+// interactiveSample is the captured `claude agents --json` fixture. It is
+// embedded rather than read from testdata/ at run time because make test-linux
+// runs the cross-compiled test binary alone in a container, with no package
+// directory beside it, so a relative os.ReadFile("testdata/...") finds nothing
+// there. Embedding ships the bytes inside the binary and travels with it.
+//
+//go:embed testdata/agents.json
+var interactiveSample string
 
 // The state table from RFC 1 section 10.2, asserted the way the hook mapping
 // is: this is the second place a vendor's vocabulary is allowed to appear, so
@@ -465,11 +475,7 @@ func TestPollHandlesCapturedInteractiveSample(t *testing.T) {
 	restore := pollCommand
 	t.Cleanup(func() { pollCommand = restore })
 
-	sample, err := os.ReadFile(filepath.Join("testdata", "agents.json"))
-	if err != nil {
-		t.Fatalf("read fixture: %v", err)
-	}
-	pollCommand = fakeCommand(t, string(sample))
+	pollCommand = fakeCommand(t, interactiveSample)
 
 	a := New()
 	sessions, _, err := a.Poll(context.Background())
