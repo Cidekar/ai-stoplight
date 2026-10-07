@@ -13,6 +13,13 @@
 
 GO ?= go
 BINARY ?= stoplight
+# The version stamped into the binary. The release workflow passes the tag it
+# is cutting; a plain `make build` leaves it as the "dev" default in cmd.go, so
+# a hand-built binary never claims a release version.
+VERSION ?= dev
+# -s -w strip the symbol table and DWARF, which only shrink the shipped binary;
+# -X injects the version string into the variable in package main.
+LDFLAGS ?= -s -w -X main.version=$(VERSION)
 # The platforms the service package has a manager for. unsupported.go
 # covers the rest, so these are the ones worth compiling.
 PLATFORMS ?= linux windows darwin
@@ -28,7 +35,7 @@ help: ## List the available targets
 
 .PHONY: build
 build: ## Build the binary for this platform
-	$(GO) build -o $(BINARY) .
+	$(GO) build -ldflags "$(LDFLAGS)" -o $(BINARY) .
 
 .PHONY: test
 test: ## Run the tests for this platform

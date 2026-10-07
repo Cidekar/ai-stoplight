@@ -1,0 +1,157 @@
+# Release flow. Manual only, main only.
+#
+# This is a small semantic-release: it reads Conventional Commit prefixes
+# since the last tag, decides the next version, builds the binaries, and cuts
+# a GitHub Release with auto-generated notes. There is no node toolchain and
+# no third-party action doing the versioning — the whole decision is the
+# shell step below, so what ships is what you can read here.
+#
+# Dispatch it from the Actions tab. It refuses to run on any ref but main, so
+# a release always reflects what landed on the default branch. Merge dev into
+# main first, then run this.
+name: release
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Compute the version and build, but do not tag or publish"
+        type: boolean
+        default: false
+
+# Tagging and creating a release both write to the repo.
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: cidekar-anvil
+    steps:
+      - name: Refuse to run off main
+        if: github.ref != 'refs/heads/main'
+        run: |
+          echo "::error::release runs on main only; this ref is ${{ github.ref }}"
+          exit 1
+
+      - name: Check out full history
+        uses: actions/checkout@v4
+        with:
+          # The version decision reads every commit since the last tag, and
+          # tags themselves must be present, so a shallow clone will not do.
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Run the test gate
+        # The same gate contributors run, minus test-linux: that target needs
+        # Docker to run the cross-compiled Linux binaries in a container, which
+        # the runner may not have. cross still compiles every package for every
+        # platform, so a platform-specific build break is still caught.
+        run: make lint cross test
+
+      - name: Decide the next version
+        id: version
+        run: |
+          set -euo pipefail
+
+          # The last release tag, or empty for the very first release.
+          last="$(git tag --list 'v*' --sort=-v:refname | head -n1 || true)"
+
+          if [ -z "$last" ]; then
+            # No tag yet. Start the line at v0.1.0 rather than deriving a bump
+            # from nothing. This is the one version the commits do not decide.
+            next="v0.1.0"
+            range=""
+            echo "no previous tag; first release is $next"
+          else
+            range="${last}..HEAD"
+            # What kind of bump do the commits since $last call for? Conventional
+            # Commits: a breaking change is major, a feat is minor, anything else
+            # (fix, perf, refactor, ...) is patch. A '!' before the ':' or a
+            # 'BREAKING CHANGE' footer marks a break.
+            log="$(git log --format='%B' "$range")"
+            bump="patch"
+            if printf '%s' "$log" | grep -qE '^[a-z]+(\([^)]+\))?!:' \
+              || printf '%s' "$log" | grep -q 'BREAKING CHANGE'; then
+              bump="major"
+            elif printf '%s' "$log" | grep -qE '^feat(\([^)]+\))?:'; then
+              bump="minor"
+            fi
+
+            ver="${last#v}"
+            major="${ver%%.*}"; rest="${ver#*.}"
+            minor="${rest%%.*}"; patch="${rest#*.}"
+            case "$bump" in
+              major) major=$((major + 1)); minor=0; patch=0 ;;
+              minor) minor=$((minor + 1)); patch=0 ;;
+              patch) patch=$((patch + 1)) ;;
+            esac
+            next="v${major}.${minor}.${patch}"
+            echo "last=$last bump=$bump next=$next"
+          fi
+
+          # Guard: nothing new to release.
+          if [ -n "$range" ] && [ -z "$(git log --oneline "$range")" ]; then
+            echo "::error::no commits since $last; nothing to release"
+            exit 1
+          fi
+
+          {
+            echo "next=$next"
+            echo "last=$last"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Build the release binaries
+        run: |
+          set -euo pipefail
+          next="${{ steps.version.outputs.next }}"
+          mkdir -p dist
+          # The platforms the service package has a manager for, both common
+          # architectures. The binary name carries OS and arch so a release
+          # page lists them unambiguously.
+          for pair in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64 windows/arm64; do
+            os="${pair%/*}"; arch="${pair#*/}"
+            out="dist/stoplight-${next}-${os}-${arch}"
+            [ "$os" = "windows" ] && out="${out}.exe"
+            echo "==> $out"
+            GOOS="$os" GOARCH="$arch" CGO_ENABLED=0 \
+              go build -trimpath -ldflags "-s -w -X main.version=${next}" -o "$out" .
+          done
+          ls -la dist
+
+      - name: Tag the release
+        if: ${{ !inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          next="${{ steps.version.outputs.next }}"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag -a "$next" -m "$next"
+          git push origin "$next"
+
+      - name: Publish the release with generated notes
+        if: ${{ !inputs.dry_run }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          next="${{ steps.version.outputs.next }}"
+          last="${{ steps.version.outputs.last }}"
+          # --generate-notes builds the changelog from merged PRs and commits.
+          # --notes-start-tag anchors it at the previous release so the notes
+          # cover exactly this release's range; omitted on the first release,
+          # where there is no earlier tag to start from.
+          args=(release create "$next" dist/* --title "$next" --generate-notes)
+          if [ -n "$last" ]; then
+            args+=(--notes-start-tag "$last")
+          fi
+          gh "${args[@]}"
+
+      - name: Dry run summary
+        if: ${{ inputs.dry_run }}
+        run: |
+          echo "DRY RUN: would release ${{ steps.version.outputs.next }}"
+          echo "No tag was pushed and no release was created."

@@ -35,6 +35,12 @@ const (
 	exitUsage = 2
 )
 
+// version is the release version, stamped at build time with
+// -ldflags "-X main.version=vX.Y.Z" by the release workflow. It stays "dev"
+// for a plain `go build` or `make build`, so a binary that was not cut by the
+// release pipeline says so rather than claiming a version it does not have.
+var version = "dev"
+
 // defaultAddr is the loopback address the relay listens on, per RFC 1 section
 // 4.1. Loopback only: a status light is for the machine you are sitting at.
 const defaultAddr = relay.DefaultListenAddr
@@ -84,6 +90,9 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return cmdService(rest, stdout, stderr)
 	case "task":
 		return cmdTask(rest, stdout, stderr)
+	case "version":
+		fmt.Fprintln(stdout, version)
+		return exitOK
 	case "help":
 		usage(stdout)
 		return exitOK
@@ -120,6 +129,7 @@ Commands:
   task <text>        override the screen label for this session
   task --clear       remove the override and show the derived label again
   notify <event>     report one event. Called by hooks, not by you.
+  version            print the build version and exit
 
 Flags for the bare command:
   --virtual              use the virtual light instead of hardware
