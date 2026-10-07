@@ -146,6 +146,28 @@ func TestSystemdInstallWritesTheUnit(t *testing.T) {
 	}
 }
 
+// TestSystemdReinstallRestartsARunningRelay covers the reinstall path: a
+// relay already active has to adopt the rewritten unit. systemd leaves the old
+// process running until the unit is restarted, so without this a `stoplight
+// install --ble` over a running relay would report success and keep the
+// previous transport until the next login.
+func TestSystemdReinstallRestartsARunningRelay(t *testing.T) {
+	s, rec := newTestSystemd(t)
+	if err := s.Install("/usr/local/bin/stoplight"); err != nil {
+		t.Fatal(err)
+	}
+
+	rec.calls = nil
+	if err := s.Install("/usr/local/bin/stoplight", "--ble"); err != nil {
+		t.Fatalf("reinstall: %v", err)
+	}
+	// try-restart restarts the unit only when it is already active, so a
+	// running relay is relaunched while a stopped one is left alone.
+	if !rec.ran("systemctl", "--user", "try-restart", systemdUnit) {
+		t.Errorf("reinstall did not restart the unit, calls: %+v", rec.calls)
+	}
+}
+
 func TestSystemdInstallIsIdempotent(t *testing.T) {
 	s, _ := newTestSystemd(t)
 

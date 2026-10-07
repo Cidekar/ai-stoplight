@@ -106,6 +106,51 @@ func TestSchtasksInstall(t *testing.T) {
 	}
 }
 
+// TestSchtasksReinstallRestartsARunningRelay covers the reinstall path.
+// /Create /F overwrites the task definition but leaves the running process on
+// the old command line, and schtasks has no restart, so without this a
+// reinstall over a running relay would keep the previous transport until the
+// next logon. Install must end the stale process and run the task again.
+func TestSchtasksReinstallRestartsARunningRelay(t *testing.T) {
+	s, rec := newTestSchtasks()
+	// Running() reads the Status column, so the task reports as running.
+	rec.out = []byte(`"\Stoplight\Relay","N/A","Running"`)
+
+	if err := s.Install(`C:\stoplight.exe`, "--ble"); err != nil {
+		t.Fatalf("Install: %v", err)
+	}
+	if !rec.ran("schtasks", "/Create") {
+		t.Errorf("/Create was not called, calls: %+v", rec.calls)
+	}
+	// The stale process is ended, then the task is run again on the new
+	// definition.
+	if !rec.ran("schtasks", "/End") {
+		t.Errorf("the running task was not ended, calls: %+v", rec.calls)
+	}
+	if !rec.ran("schtasks", "/Run") {
+		t.Errorf("the task was not re-run after the overwrite, calls: %+v", rec.calls)
+	}
+}
+
+// TestSchtasksInstallLeavesAStoppedRelayStopped is the other half: a reinstall
+// must not start a relay the user had stopped. With no running task there is
+// nothing to adopt, so Install only overwrites the definition.
+func TestSchtasksInstallLeavesAStoppedRelayStopped(t *testing.T) {
+	s, rec := newTestSchtasks()
+	// Running() reads the Status column, which here reports Ready, not Running.
+	rec.out = []byte(`"\Stoplight\Relay","N/A","Ready"`)
+
+	if err := s.Install(`C:\stoplight.exe`); err != nil {
+		t.Fatalf("Install: %v", err)
+	}
+	if rec.ran("schtasks", "/End") {
+		t.Errorf("a stopped relay was ended, calls: %+v", rec.calls)
+	}
+	if rec.ran("schtasks", "/Run") {
+		t.Errorf("a stopped relay was started on reinstall, calls: %+v", rec.calls)
+	}
+}
+
 func TestSchtasksInstallIsIdempotent(t *testing.T) {
 	s, _ := newTestSchtasks()
 
