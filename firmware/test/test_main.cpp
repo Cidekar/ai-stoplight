@@ -1304,6 +1304,84 @@ void testRolloverSafety() {
     d.advance(1100);
     check(!d.holdingRed(), "a manual advance cleared the hold");
   }
+
+  // A lone red session's hold must expire on its own deadline, not wait for a
+  // rotation that can never happen. With one session rotation never runs, so
+  // the only thing that can clear the flag is the deadline itself. A hold that
+  // outlives its deadline is the defect: it blocks rotation for the next 24.9
+  // days once (int32_t)(now - holdUntil_) wraps negative and a second session
+  // appears.
+  {
+    Display d;
+    Frame f;
+    check(parseFrame("{\"color\":\"red\",\"sessions\":[{\"id\":\"a1\","
+                     "\"label\":\"solo\",\"state\":\"needs you\","
+                     "\"color\":\"red\"}]}",
+                     &f),
+          "the lone red frame parses");
+    d.applyFrame(f, 1000);
+    check(d.holdingRed(), "the lone red session took a hold");
+
+    // Just short of the deadline the hold is still in force.
+    d.tick(1000 + DISP_ROTATE_MIN_MS - 1);
+    check(d.holdingRed(), "the hold is still in force before its deadline");
+
+    // On the deadline it clears, even though rotation never ran.
+    d.tick(1000 + DISP_ROTATE_MIN_MS);
+    check(!d.holdingRed(),
+          "the hold expired on its deadline without a rotation");
+
+    // The session is lone and red, so the screen stays on it: the lamp names
+    // something that needs a human and the screen must keep saying which.
+    checkStr(d.currentLabel(), "solo",
+             "the lone red session keeps the screen past the hold");
+  }
+
+  // The wedge the expiry prevents: a hold left standing past 2^31 ms makes
+  // (int32_t)(now - holdUntil_) negative again, which blocked rotation for the
+  // next 24.9 days once a second session appeared. With the hold expired on
+  // time, a later second session rotates normally.
+  {
+    Display d;
+    Frame f;
+    check(parseFrame("{\"color\":\"red\",\"sessions\":[{\"id\":\"a1\","
+                     "\"label\":\"solo\",\"state\":\"needs you\","
+                     "\"color\":\"red\"}]}",
+                     &f),
+          "the lone red frame parses");
+    d.applyFrame(f, 1000);
+    check(d.holdingRed(), "the lone red session took a hold");
+
+    // Let the hold expire, then run time well past 2^31 ms from the deadline,
+    // where a stale flag would read (int32_t)(now - holdUntil_) < 0 again.
+    d.tick(1000 + DISP_ROTATE_MIN_MS);
+    check(!d.holdingRed(), "the hold is gone before the sign flips");
+
+    // Two green sessions arrive long after the deadline. Rotation must advance
+    // rather than stay wedged on the hold.
+    Frame g;
+    check(parseFrame("{\"color\":\"green\",\"sessions\":[{\"id\":\"a1\","
+                     "\"label\":\"one\",\"state\":\"working\","
+                     "\"color\":\"green\"},{\"id\":\"b2\",\"label\":\"two\","
+                     "\"state\":\"working\",\"color\":\"green\"}]}",
+                     &g),
+          "the two-green frame parses");
+    const uint32_t late = 1000u + 0x80000000u + 50000u;  // well past 2^31 ms
+    d.applyFrame(g, late);
+    check(!d.holdingRed(), "no hold once nothing is red");
+    char startLabel[SL_MAX_LABEL + 1];
+    snprintf(startLabel, sizeof(startLabel), "%s", d.currentLabel());
+    bool rotated = false;
+    for (uint32_t t = 0; t <= 60000u; t += 250u) {
+      d.tick(late + t);
+      if (strcmp(d.currentLabel(), startLabel) != 0) {
+        rotated = true;
+        break;
+      }
+    }
+    check(rotated,
+          "rotation runs within 60s: a stale hold did not wedge it for days");
+  }
 }
 
 // ---------------------------------------------------------------------------
