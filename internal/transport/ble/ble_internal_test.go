@@ -240,6 +240,137 @@ func deadline(t *testing.T, d time.Duration, what string, fn func()) {
 	}
 }
 
+// --- enableAdapter: cache the terminal answers, retry the rest --------------
+//
+// These exercise the radio-setup seam rather than the connector seam the Send
+// and Connect tests use. adapterEnabler stands in for the library's Enable, and
+// resetAdapterState clears the process-wide cache between cases so one test does
+// not inherit another's answer. They share package globals, so none of them run
+// in parallel.
+
+// A transient enable failure -- the radio switched off, or a slow stack -- must
+// not be cached. The relay starts as a login item while Bluetooth is off, and
+// once it comes on the next attempt must call Enable again rather than serving
+// the stale "unavailable" forever. This is the bug in issue #6.
+func TestEnableAdapterRetriesAfterTransientFailure(t *testing.T) {
+	var calls atomic.Int32
+	defer swapEnabler(func() error {
+		if calls.Add(1) == 1 {
+			return errors.New("bluetooth is powered off")
+		}
+		return nil
+	})()
+	resetAdapterState()
+	defer resetAdapterState()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	if err := enableAdapter(ctx); !errors.Is(err, ErrUnavailable) {
+		t.Fatalf("first enableAdapter = %v, want it to wrap ErrUnavailable", err)
+	}
+	if err := enableAdapter(ctx); err != nil {
+		t.Fatalf("second enableAdapter after the radio came on: %v", err)
+	}
+	if got := calls.Load(); got != 2 {
+		t.Errorf("Enable called %d times, want 2 (the transient error must be retried)", got)
+	}
+}
+
+// A caller that leaves on its own deadline must not pin "did not respond in
+// time" for the process. The first-run permission prompt can outlast the three
+// seconds the CLI allows for auto-discovery, so the caller returns ErrUnavailable
+// while the library's Enable is still waiting; a later connect must try again.
+// Here the slow first attempt ends in a transient failure, which the second
+// attempt retries past.
+func TestEnableAdapterRetriesAfterCallerTimeout(t *testing.T) {
+	release := make(chan struct{})
+	var calls atomic.Int32
+	defer swapEnabler(func() error {
+		if calls.Add(1) == 1 {
+			<-release // the first call outlasts the caller's deadline
+			return errors.New("bluetooth is powered off")
+		}
+		return nil
+	})()
+	resetAdapterState()
+	defer resetAdapterState()
+
+	// A deadline shorter than the hung first call, so the caller leaves on it
+	// rather than on the adapter's answer.
+	fastCtx, cancelFast := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancelFast()
+	if err := enableAdapter(fastCtx); !errors.Is(err, ErrUnavailable) {
+		t.Fatalf("enableAdapter on a slow stack = %v, want it to wrap ErrUnavailable", err)
+	}
+
+	// Let the abandoned first call finish. Its answer was retryable, so nothing
+	// terminal is cached and the lock is released for the next attempt.
+	close(release)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	// The abandoned goroutine holds the lock until it returns, so this retry
+	// waits for it and then runs its own Enable, which now succeeds.
+	deadline(t, 3*time.Second, "enableAdapter retry", func() {
+		if err := enableAdapter(ctx); err != nil {
+			t.Errorf("enableAdapter after the radio came on: %v", err)
+		}
+	})
+	if got := calls.Load(); got != 2 {
+		t.Errorf("Enable called %d times, want 2 (the abandoned attempt must not latch)", got)
+	}
+}
+
+// A permission refusal is terminal: only the user can reverse it, so it is
+// cached and Enable is not called a second time. Caching the wrong answer here
+// would be a tight retry loop against a decision that will not change.
+func TestEnableAdapterCachesPermissionDenied(t *testing.T) {
+	var calls atomic.Int32
+	defer swapEnabler(func() error {
+		calls.Add(1)
+		return errors.New("access denied")
+	})()
+	resetAdapterState()
+	defer resetAdapterState()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	for i := range 3 {
+		if err := enableAdapter(ctx); !errors.Is(err, ErrPermissionDenied) {
+			t.Fatalf("enableAdapter #%d = %v, want it to wrap ErrPermissionDenied", i+1, err)
+		}
+	}
+	if got := calls.Load(); got != 1 {
+		t.Errorf("Enable called %d times for a refusal, want 1 (it must be cached)", got)
+	}
+}
+
+// Success is terminal too: a working adapter does not need re-enabling, and the
+// darwin backend rejects a second Enable outright.
+func TestEnableAdapterCachesSuccess(t *testing.T) {
+	var calls atomic.Int32
+	defer swapEnabler(func() error {
+		calls.Add(1)
+		return nil
+	})()
+	resetAdapterState()
+	defer resetAdapterState()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	for i := range 3 {
+		if err := enableAdapter(ctx); err != nil {
+			t.Fatalf("enableAdapter #%d: %v", i+1, err)
+		}
+	}
+	if got := calls.Load(); got != 1 {
+		t.Errorf("Enable called %d times, want 1 (success must be cached)", got)
+	}
+}
+
 // --- Connect: retry, backoff and cancellation -------------------------------
 
 // 1. A light that is switched off must not make Connect give up. It retries
