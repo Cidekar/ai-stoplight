@@ -1,0 +1,23 @@
+# The gate every pull request has to pass.
+#
+# `make check` is the same command the readme tells a contributor to run before
+# opening a PR, so a green check here means the same thing it means locally:
+# lint clean, every package compiles for every platform, and the tests pass.
+# test-linux runs too when the runner has Docker; it self-skips when it does
+# not, so the job stays green either way rather than failing on a missing tool.
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main, dev]
+
+jobs:
+  check:
+    runs-on: cidekar-anvil
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: make check

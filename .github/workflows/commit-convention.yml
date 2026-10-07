@@ -1,0 +1,46 @@
+# Keep the commit stream releasable.
+#
+# The release workflow decides the next version by reading Conventional Commit
+# prefixes, so a commit that does not follow the convention is a commit the
+# release cannot classify. This check guards the one subject that actually
+# lands: squash-merge uses the PR TITLE as the commit subject, so linting the
+# title is what keeps main's history conventional. It is a plain regex, no node
+# toolchain, so it reads the same as the versioning logic it protects.
+name: commit-convention
+
+on:
+  pull_request:
+    # Re-run when the title is edited, not only on new commits.
+    types: [opened, edited, synchronize, reopened]
+
+jobs:
+  title:
+    runs-on: cidekar-anvil
+    steps:
+      - name: Lint the PR title
+        env:
+          TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          set -euo pipefail
+          # type(scope)!: subject
+          #   type   one of the allowed set below
+          #   scope  optional, in parentheses
+          #   !      optional, marks a breaking change
+          #   subject non-empty
+          pattern='^(feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert)(\([a-z0-9/_-]+\))?!?: .+'
+          if printf '%s' "$TITLE" | grep -qE "$pattern"; then
+            echo "ok: $TITLE"
+            exit 0
+          fi
+          cat >&2 <<EOF
+          ::error::PR title is not a Conventional Commit: "$TITLE"
+
+          Expected: <type>(<scope>)?: <subject>
+            types:  feat fix docs style refactor perf test build ci chore revert
+            break:  add ! before the colon, e.g. feat!: or feat(relay)!:
+          Examples:
+            fix(relay): resend a lost frame
+            feat(ble): add a scan timeout flag
+            docs: correct the install steps
+          EOF
+          exit 1

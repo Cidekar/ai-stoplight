@@ -289,6 +289,23 @@ func TestUnknownCommand(t *testing.T) {
 	}
 }
 
+// TestVersion checks that `stoplight version` prints the stamped version to
+// stdout and exits zero. The default is "dev" because the test binary is not
+// built through the release workflow, so that is what a plain build reports.
+func TestVersion(t *testing.T) {
+	code, stdout, stderr := runCLI("version")
+
+	if code != exitOK {
+		t.Errorf("exit code = %d, want %d", code, exitOK)
+	}
+	if stderr != "" {
+		t.Errorf("stderr = %q, want empty", stderr)
+	}
+	if got := strings.TrimSpace(stdout); got != version {
+		t.Errorf("stdout = %q, want the stamped version %q", got, version)
+	}
+}
+
 // TestHelp checks that every documented command appears in the help text, on
 // stdout, with a zero exit code.
 func TestHelp(t *testing.T) {
@@ -307,7 +324,7 @@ func TestHelp(t *testing.T) {
 			// command.
 			want := []string{
 				"install", "uninstall", "status", "restart", "logs",
-				"service stop", "service disable", "task", "notify",
+				"service stop", "service disable", "task", "notify", "version",
 				"--virtual", "--serial", "--addr", "--timeout",
 			}
 			for _, w := range want {
