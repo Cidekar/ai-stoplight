@@ -46,10 +46,18 @@ func (s *schtasks) Command() string {
 //
 // Task Scheduler has no supervisor equivalent to KeepAlive, so restart on
 // failure is configured separately in Install.
+//
+// Every token in /TR is quoted, not just the binary path. The relay reads
+// its flags back off this one string, so a value with a space in it, such
+// as `--ble-name "Stoplight A4"`, must stay one argument. Joining the
+// tokens raw would hand the relay `--ble-name Stoplight` and leave `A4` as
+// a stray positional that the flag parser drops, so the service would
+// connect to the wrong light. Install rejects a value a command line
+// cannot carry, so quoteArg here only has to wrap, never escape.
 func createArgs(binPath string, relayArgs ...string) []string {
-	tr := `"` + binPath + `" relay`
-	if len(relayArgs) > 0 {
-		tr += " " + strings.Join(relayArgs, " ")
+	tr := quoteArg(binPath) + " relay"
+	for _, a := range relayArgs {
+		tr += " " + quoteArg(a)
 	}
 	return []string{
 		"/Create",
@@ -61,8 +69,53 @@ func createArgs(binPath string, relayArgs ...string) []string {
 	}
 }
 
+// quoteArg renders one argument for the /TR command line.
+//
+// The task's command line is split by the Windows C runtime rules that
+// CommandLineToArgvW implements: a run of whitespace separates arguments
+// unless it sits inside double quotes. Wrapping every token in quotes
+// keeps a value with a space in it whole and leaves a value without one
+// unchanged after the split. A token is never left bare, because the
+// splitter that reads it back cannot tell an intended space from a
+// separator otherwise.
+//
+// A double quote is not escaped here but refused in validateArg, so this
+// only has to wrap. An argument that already holds no quote survives the
+// round trip exactly.
+func quoteArg(arg string) string {
+	return `"` + arg + `"`
+}
+
+// validateArg rejects a relay argument a schtasks /TR string cannot carry.
+//
+// A double quote would open or close a quoted run inside the value and so
+// change where the splitter breaks the next argument, exactly the kind of
+// corruption quoting is meant to prevent. A newline cannot appear in a
+// task command line at all. Refusing both, rather than attempting an
+// escape, is the same answer validateUnitPath gives on the systemd side:
+// a value the format cannot represent is a value the service must not be
+// built from.
+func validateArg(arg string) error {
+	if strings.ContainsAny(arg, "\"\n\r") {
+		return fmt.Errorf("the relay argument %q contains a quote or line break, which a scheduled task command cannot carry, so the service cannot be installed", arg)
+	}
+	return nil
+}
+
 // Install registers the logon task, replacing any previous version.
 func (s *schtasks) Install(binPath string, relayArgs ...string) error {
+	// Both the binary path and every relay argument are written into the
+	// one /TR string, so a value the command line cannot represent is
+	// refused before anything is registered.
+	if err := validateArg(binPath); err != nil {
+		return err
+	}
+	for _, a := range relayArgs {
+		if err := validateArg(a); err != nil {
+			return err
+		}
+	}
+
 	// A running instance has to be adopted on a reinstall. /Create /F
 	// overwrites the task definition but leaves the already-running process
 	// alive on the old command line, and schtasks has no restart, so a plain
