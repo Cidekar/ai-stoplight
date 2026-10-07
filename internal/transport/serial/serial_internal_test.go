@@ -470,3 +470,68 @@ func TestConcurrentSendAndCloseUnderRace(t *testing.T) {
 		t.Error("Connected() is true after Close")
 	}
 }
+
+// wedgePort blocks inside Write until it is released. It stands in for a board
+// that has stopped draining its CDC queue: on darwin the Go runtime does not
+// poll a character device, so a Write to such a board blocks in the kernel with
+// no deadline. Close releases the block, the way closing a real fd aborts the
+// pending write.
+type wedgePort struct {
+	release chan struct{}
+	once    sync.Once
+}
+
+func (p *wedgePort) Write(b []byte) (int, error) {
+	<-p.release
+	return len(b), nil
+}
+func (p *wedgePort) Read([]byte) (int, error) { return 0, io.EOF }
+func (p *wedgePort) Close() error {
+	p.once.Do(func() { close(p.release) })
+	return nil
+}
+
+// 7. The regression for issue #8: a Send wedged in Write must not block
+// Connected or Close. The whole fix exists so the relay's connection poll,
+// `stoplight status`, and shutdown stay responsive while a board is stuck.
+func TestWedgedWriteDoesNotBlockConnectedOrClose(t *testing.T) {
+	wp := &wedgePort{release: make(chan struct{})}
+	tr := newWithOpener("/dev/cu.usbmodemFAKE", func(string) (io.ReadWriteCloser, error) {
+		return wp, nil
+	})
+	if err := tr.Connect(context.Background()); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+
+	// Start a Send that wedges inside Write and never returns on its own.
+	sendReturned := make(chan struct{})
+	go func() {
+		defer close(sendReturned)
+		_ = tr.Send(frame())
+	}()
+	// Give the Send time to reach Write and park there.
+	time.Sleep(50 * time.Millisecond)
+
+	// Connected answers at once, reading the atomic rather than the lock the
+	// write path would hold if it took one.
+	deadline(t, time.Second, "Connected during a wedged write", func() {
+		if !tr.Connected() {
+			t.Error("Connected() is false while the port is open")
+		}
+	})
+
+	// Close returns at once too, and releasing the wedged write lets the Send
+	// goroutine unwind rather than leak.
+	deadline(t, time.Second, "Close during a wedged write", func() {
+		if err := tr.Close(); err != nil {
+			t.Errorf("Close: %v", err)
+		}
+	})
+
+	deadline(t, time.Second, "wedged Send after Close", func() {
+		<-sendReturned
+	})
+	if tr.Connected() {
+		t.Error("Connected() is true after Close")
+	}
+}
