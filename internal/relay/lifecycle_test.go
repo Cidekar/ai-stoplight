@@ -748,15 +748,25 @@ func TestSlowShutdownDoesNotUnlinkTheNextRelaysSocket(t *testing.T) {
 	go func() { doneA <- relayA.Run(ctxA) }()
 	waitForAddr(t, relayA)
 
-	// Open a connection and say nothing. A's handler holds it for
-	// socketReadTimeout, so A's wg.Wait during shutdown takes real time.
+	// Open a connection and send an incomplete object. A's handler blocks in
+	// its read waiting for the rest until socketReadTimeout, so A's wg.Wait
+	// during shutdown takes real time, which is the window B binds in.
+	//
+	// The accept does not need to be observed before cancelA below. Shutdown
+	// closes the socket listener only AFTER loop returns (see Relay.Run), so
+	// the accept loop is still running when cancelA fires and picks up this
+	// already-queued connection regardless of timing. The previous
+	// time.Sleep(50ms) tried to confirm the accept up front and was only a
+	// guess: under CPU contention 50ms was not always enough, which is what
+	// made this test flaky.
 	stall, err := netDial(socket)
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
 	defer stall.Close()
-	// Let the accept land before shutting A down.
-	time.Sleep(50 * time.Millisecond)
+	if _, err := stall.Write([]byte("{")); err != nil {
+		t.Fatalf("write to stall conn: %v", err)
+	}
 
 	cancelA()
 

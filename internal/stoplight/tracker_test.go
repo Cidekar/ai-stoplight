@@ -1690,10 +1690,23 @@ func TestManySessionsStayResponsive(t *testing.T) {
 			}, base.Add(time.Duration(i)*time.Millisecond))
 		}
 	}()
+	// The budget guards against an algorithmic blowup in Apply (for example a
+	// per-call scan that turns the loop quadratic), not against a few hundred
+	// milliseconds of jitter. A tight wall-clock bound is the wrong tool for
+	// that: under the full `make check` run every package tests concurrently
+	// under -race, and this probe lost its race against a 60s deadline on a
+	// loaded machine while passing in isolation. A quadratic regression would
+	// overrun any bound in this range by orders of magnitude, so a generous
+	// deadline catches the failure this test exists for without flaking on CPU
+	// contention. -race roughly decuples the work, so budget for it explicitly.
+	budget := 120 * time.Second
+	if raceEnabled {
+		budget = 240 * time.Second
+	}
 	select {
 	case <-done:
-	case <-time.After(60 * time.Second):
-		t.Fatal("50,000 applies did not finish in 60s")
+	case <-time.After(budget):
+		t.Fatalf("50,000 applies did not finish in %v", budget)
 	}
 	if got := len(tracker.Sessions()); got > MaxLiveSessions {
 		t.Errorf("len(Sessions()) = %d, want at most %d", got, MaxLiveSessions)
