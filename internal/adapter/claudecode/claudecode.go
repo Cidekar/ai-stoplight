@@ -26,6 +26,14 @@ type hookMapping struct {
 	Hook string
 	// Event is the RFC 1 event posted to the relay.
 	Event string
+	// Matcher narrows a hook to the sub-events it should fire on, written
+	// as the group's "matcher" key. Empty means every occurrence, which is
+	// correct only for a hook whose every occurrence means the same event.
+	//
+	// Claude Code tests the matcher against a different field per hook:
+	// a notification type for Notification, a session-start reason for
+	// SessionStart, a tool name for PreToolUse. The value is a regexp.
+	Matcher string
 }
 
 // mappings is the vendor boundary. Adding a row here is the only change
@@ -33,10 +41,37 @@ type hookMapping struct {
 // affected.
 //
 // Ordered as in the RFC so a written file reads like the spec.
+//
+// The matchers are not decoration: without them two of these hooks report
+// a colour the session is not in.
+//
+//   - SessionStart fires on five reasons, not one. Only "startup" means a
+//     session that is idle and waiting for its first prompt. "resume",
+//     "clear", "fork" and above all "compact" fire mid-session, and an
+//     auto-compaction drops a working session to idle until the next Stop.
+//     Matching "startup" keeps `idle` to the one reason that is idle.
+//
+//   - Notification fires on every notification type. "permission_prompt"
+//     is the one that means "waiting for you". "idle_prompt" fires about a
+//     minute after a turn ends and would turn a green session red; and
+//     "auth_success" flashes at login. Matching "permission_prompt" keeps
+//     `blocked` to a session that is really blocked.
+//
+//   - PreToolUse has no colour of its own. It exists only to clear
+//     `blocked`: when the user approves a permission prompt the agent runs
+//     the tool, and the next thing Claude Code emits is this hook, long
+//     before Stop. Without it an approved prompt stays red for the rest of
+//     the turn, because nothing between Notification and Stop sends an
+//     event. `started` returns the session to yellow, which the state
+//     machine accepts from blocked (color.go, State.Next). It carries no
+//     matcher because it must fire for every tool, and an absent matcher
+//     means every tool. The poll side agrees: a running session reports
+//     "working", which maps to `started` too (poll.go).
 var mappings = []hookMapping{
-	{Hook: "SessionStart", Event: "idle"},
+	{Hook: "SessionStart", Event: "idle", Matcher: "startup"},
 	{Hook: "UserPromptSubmit", Event: "started"},
-	{Hook: "Notification", Event: "blocked"},
+	{Hook: "PreToolUse", Event: "started"},
+	{Hook: "Notification", Event: "blocked", Matcher: "permission_prompt"},
 	{Hook: "Stop", Event: "finished"},
 	{Hook: "SessionEnd", Event: "ended"},
 }
@@ -238,10 +273,18 @@ func (a *Adapter) Install(binPath string) error {
 		// joining another tool's group, so uninstall can remove it
 		// cleanly.
 		//
-		// The matcher key is omitted deliberately. UserPromptSubmit and
-		// Stop do not take one, and for SessionStart and Notification an
-		// absent matcher means every occurrence, which is what we want.
+		// A mapping with a matcher writes it as the group's "matcher" key,
+		// so the hook fires only on the sub-event this event means.
+		// UserPromptSubmit, Stop and SessionEnd carry no matcher: every
+		// occurrence of each means the same event, so narrowing would only
+		// drop a light the producer asked for.
+		//
+		// The matcher is set before "hooks" so a fresh group reads
+		// matcher-then-hooks, the order Claude Code writes its own.
 		group := newObject()
+		if m.Matcher != "" {
+			group.Set("matcher", m.Matcher)
+		}
 		group.Set("hooks", []any{entry})
 		hooks.Set(m.Hook, append(groups, group))
 	}
@@ -249,12 +292,35 @@ func (a *Adapter) Install(binPath string) error {
 	return s.save(path)
 }
 
+// isBareGroup reports whether a group holds nothing but the keys Install
+// writes: "hooks", and optionally "matcher".
+//
+// This is the shape test that decides a group is a container we built
+// rather than another tool's. Once our hooks were matcher-less, that was
+// the single key "hooks"; now a matched hook adds a "matcher" sibling, so
+// a group of ours may hold two keys. Any third key means a tool wrote
+// fields we do not understand, and the group is not ours to touch.
+//
+// It says nothing about the entries inside: a caller that cares pairs this
+// with isOurs on each entry.
+func isBareGroup(group *object) bool {
+	if _, ok := group.Get("hooks"); !ok {
+		return false
+	}
+	for _, k := range group.Keys() {
+		if k != "hooks" && k != "matcher" {
+			return false
+		}
+	}
+	return true
+}
+
 // dropEmptyOwnGroups removes groups that collapsing duplicates left with
 // no entries at all.
 //
-// Only a bare group goes: one whose sole key is "hooks". A group that
-// carries a matcher belongs to whoever wrote the matcher, and an empty
-// group that arrived that way is not ours to tidy.
+// Only a bare group goes: one holding nothing but "hooks" and perhaps our
+// "matcher". A group that carries any other key belongs to whoever wrote
+// it, and an empty group that arrived that way is not ours to tidy.
 func dropEmptyOwnGroups(groups []any) []any {
 	kept := make([]any, 0, len(groups))
 	for _, g := range groups {
@@ -263,7 +329,7 @@ func dropEmptyOwnGroups(groups []any) []any {
 			kept = append(kept, g)
 			continue
 		}
-		if entries, ok := group.Get("hooks"); ok && group.Len() == 1 {
+		if entries, ok := group.Get("hooks"); ok && isBareGroup(group) {
 			if list, ok := entries.([]any); ok && len(list) == 0 {
 				continue
 			}
@@ -288,8 +354,9 @@ func wasAddedByUs(groups []any) bool {
 		if !ok {
 			return false
 		}
-		// A matcher or any other sibling key means someone else built it.
-		if group.Len() != 1 {
+		// Only "hooks" and our own "matcher" belong in a group we built.
+		// Any other sibling key means someone else wrote it.
+		if !isBareGroup(group) {
 			return false
 		}
 		v, ok := group.Get("hooks")
@@ -372,8 +439,9 @@ func (a *Adapter) Uninstall() error {
 			}
 			// Drop a group only when we are the ones who emptied it, and
 			// only when it holds nothing else worth keeping. A group that
-			// carried a matcher and other entries stays.
-			if touched && empty && group.Len() == 1 {
+			// carries a foreign key stays even once empty: isBareGroup
+			// accepts our own "matcher" sibling but nothing else.
+			if touched && empty && isBareGroup(group) {
 				continue
 			}
 			kept = append(kept, group)

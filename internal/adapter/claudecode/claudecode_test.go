@@ -33,9 +33,10 @@ func TestMappingMatchesTheRFC(t *testing.T) {
 	// The table in RFC 1 section 10.1. This test is the guard on the one
 	// place a vendor's vocabulary is allowed to appear.
 	want := []hookMapping{
-		{Hook: "SessionStart", Event: "idle"},
+		{Hook: "SessionStart", Event: "idle", Matcher: "startup"},
 		{Hook: "UserPromptSubmit", Event: "started"},
-		{Hook: "Notification", Event: "blocked"},
+		{Hook: "PreToolUse", Event: "started"},
+		{Hook: "Notification", Event: "blocked", Matcher: "permission_prompt"},
 		{Hook: "Stop", Event: "finished"},
 		{Hook: "SessionEnd", Event: "ended"},
 	}
@@ -168,15 +169,103 @@ func TestInstallWritesEveryMappedHook(t *testing.T) {
 	}
 }
 
-func TestInstallOmitsTheMatcherKey(t *testing.T) {
-	// UserPromptSubmit and Stop take no matcher, and for the other two an
-	// absent matcher already means every occurrence.
+// matcherFor returns the "matcher" of the first group under a hook that
+// holds an entry of ours, and whether a matcher key was present. It is the
+// companion to countOurs: it reads the matcher off our own group.
+func matcherFor(t *testing.T, path, hook string) (string, bool) {
+	t.Helper()
+	root, err := decodeObject([]byte(read(t, path)))
+	if err != nil {
+		t.Fatalf("parse %s: %v", path, err)
+	}
+	hooksVal, _ := root.Get("hooks")
+	hooks, ok := hooksVal.(*object)
+	if !ok {
+		t.Fatalf("no hooks object")
+	}
+	groupsVal, _ := hooks.Get(hook)
+	groups, ok := groupsVal.([]any)
+	if !ok {
+		t.Fatalf("no groups for %s", hook)
+	}
+	for _, g := range groups {
+		group, ok := g.(*object)
+		if !ok {
+			continue
+		}
+		entriesVal, _ := group.Get("hooks")
+		entries, ok := entriesVal.([]any)
+		if !ok {
+			continue
+		}
+		mine := false
+		for _, e := range entries {
+			if isOurs(e) {
+				mine = true
+			}
+		}
+		if !mine {
+			continue
+		}
+		m, present := group.Get("matcher")
+		if !present {
+			return "", false
+		}
+		s, _ := m.(string)
+		return s, true
+	}
+	t.Fatalf("no group of ours under %s", hook)
+	return "", false
+}
+
+func TestInstallWritesTheRightMatcher(t *testing.T) {
+	// A matcher narrows a hook to the sub-event it means. Two of these
+	// hooks give a false light without one, so the installed file must
+	// carry exactly the matcher each mapping asks for and no more.
 	path := filepath.Join(t.TempDir(), "settings.json")
 	a := newForPath(path)
 	if err := a.Install(testBin); err != nil {
 		t.Fatalf("Install: %v", err)
 	}
-	if got := read(t, path); strings.Contains(got, "matcher") {
-		t.Errorf("a matcher key was written:\n%s", got)
+
+	for _, tc := range []struct {
+		hook string
+		want string // empty means the matcher key must be absent
+	}{
+		{"SessionStart", "startup"},
+		{"Notification", "permission_prompt"},
+		{"UserPromptSubmit", ""},
+		{"PreToolUse", ""},
+		{"Stop", ""},
+		{"SessionEnd", ""},
+	} {
+		got, present := matcherFor(t, path, tc.hook)
+		if tc.want == "" {
+			if present {
+				t.Errorf("%s: matcher %q written, want none", tc.hook, got)
+			}
+			continue
+		}
+		if !present || got != tc.want {
+			t.Errorf("%s: matcher = %q (present %v), want %q", tc.hook, got, present, tc.want)
+		}
+	}
+}
+
+// TestPreToolUseClearsBlocked guards the fix for the stuck-red bug: a
+// PreToolUse hook must report `started`, which is the only event between a
+// Notification and a Stop that can move a blocked session off red.
+func TestPreToolUseClearsBlocked(t *testing.T) {
+	found := false
+	for _, m := range mappings {
+		if m.Hook == "PreToolUse" {
+			found = true
+			if m.Event != "started" {
+				t.Errorf("PreToolUse event = %q, want started", m.Event)
+			}
+		}
+	}
+	if !found {
+		t.Error("no PreToolUse mapping: an approved permission prompt would stay red until Stop")
 	}
 }
