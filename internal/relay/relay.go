@@ -197,6 +197,31 @@ type Relay struct {
 	// mu must never be held across a transport call.
 	reconnecting atomic.Bool
 
+	// acked reports that the light holds the current frame. It is cleared the
+	// moment the frame moves and whenever a Send fails, and set only by a Send
+	// that succeeds. The reconnect tick resends on any tick where it is false
+	// and the transport is connected, which is what finally covers three gaps
+	// that "transmit only on change" left open:
+	//
+	//   - A Send that fails is logged and otherwise lost. The transport
+	//     contract says an error means this frame was lost, not that the link
+	//     is dead, so a transient write error used to leave the lamp on the
+	//     previous colour until the tracker next moved. Now the next tick
+	//     resends it.
+	//   - A light power-cycled or carried out of range and back may come back
+	//     with no Connect from this relay and no edge the loop can see. It
+	//     holds its boot state while Connected still reports true. An unacked
+	//     frame is pushed regardless of whether an edge was observed.
+	//   - After the first connect nothing used to transmit until the state
+	//     changed. acked starts false, so the first tick that sees a connected
+	//     transport pushes the current frame once, with no separate startup
+	//     path to keep in step.
+	//
+	// It is atomic because transmit runs on ingest goroutines, send runs on the
+	// sender goroutine, and the reconnect tick reads it on the loop goroutine,
+	// and none of them may take mu across a transport call.
+	acked atomic.Bool
+
 	// wake signals the sender goroutine that the frame moved. It has capacity
 	// one and is written with a non-blocking send, which is what makes the
 	// sender coalescing: a signal that arrives while one is already pending is
@@ -704,6 +729,17 @@ func (r *Relay) loop(ctx context.Context) {
 			}
 			wasConnected = connected
 
+			// A connected light that does not hold the current frame must get
+			// it, whether or not an edge was seen. This covers the cases the
+			// edge above misses: a Send that failed while the link stayed up, a
+			// light that power-cycled without a Connect from this relay, and the
+			// first frame after startup, which no edge announces because the
+			// transport came up before the loop sampled it. transmit coalesces,
+			// so a settled light costs one atomic read a tick.
+			if connected && !r.acked.Load() {
+				r.transmit()
+			}
+
 			// Nothing above ever reconnects on its own. Transport.Connect is
 			// called once at startup, and a transport that drops after a
 			// failed Send stays disconnected forever unless something calls
@@ -797,6 +833,11 @@ func (r *Relay) startConnect(ctx context.Context, wg *sync.WaitGroup, retry bool
 //
 // The signal is non-blocking. An ingest handler must never wait on a radio.
 func (r *Relay) transmit() {
+	// The frame moved, so the light no longer holds the current one. Clear the
+	// ack before signalling: if the send that follows fails, the reconnect tick
+	// must still see an unacked frame and retry it.
+	r.acked.Store(false)
+
 	r.mu.Lock()
 	wake := r.wake
 	inline := r.sendInline
@@ -856,12 +897,20 @@ func (r *Relay) sender(ctx context.Context, wake <-chan struct{}) {
 
 // send writes the current frame to the transport. A failed send means this
 // frame was lost, not that the transport is dead, so the error is logged and
-// the relay carries on. The next change sends a whole frame again, which is
-// why a drop costs nothing.
+// the relay carries on.
+//
+// It records whether the light now holds the current frame. A success marks it
+// acked, so the reconnect tick leaves a settled light alone; a failure leaves
+// it unacked, so the next tick resends rather than waiting for the tracker to
+// move. That is what turns a lost frame from a permanent stale colour into a
+// one-tick delay.
 func (r *Relay) send() {
 	if err := r.cfg.Transport.Send(r.tracker.Frame()); err != nil {
+		r.acked.Store(false)
 		r.logger.Printf("send frame: %v", err)
+		return
 	}
+	r.acked.Store(true)
 }
 
 // Status returns a snapshot of what the relay is doing.
