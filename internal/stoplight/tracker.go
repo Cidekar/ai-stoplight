@@ -263,10 +263,12 @@ func (t *Tracker) Reconcile(sync Sync, now time.Time) (changed bool) {
 		}
 		declared[id] = true
 
-		if existing, found := t.sessions[id]; found && sync.ObservedAt.Before(existing.observedAt) {
+		if existing, found := t.sessions[id]; found && sync.ObservedAt.Before(existing.orderingTime()) {
 			// A newer observation already landed for this session. Keep it,
 			// but still count the session as declared so it survives the
-			// removal pass below.
+			// removal pass below. A hook-created session has no observedAt, so
+			// its arrival time (LastSeen) stands in: without it a stale sync
+			// would reverse the fresher hook reading.
 			continue
 		}
 		entry.Provider = provider
@@ -297,9 +299,11 @@ func (t *Tracker) Reconcile(sync Sync, now time.Time) (changed bool) {
 			// wrong costs one session removed early, and it will be recreated
 			// by its next report. Being wrong the other way costs a lamp that
 			// is permanently, unfixably red.
-		case session.observedAt.After(sync.ObservedAt):
+		case session.orderingTime().After(sync.ObservedAt):
 			// Observed more recently than this sync was taken, so this sync
-			// cannot speak to whether it exists.
+			// cannot speak to whether it exists. A hook-created session has no
+			// observedAt, so its arrival time (LastSeen) stands in: without it
+			// a stale sync would delete a session the hook just created.
 		default:
 			delete(t.sessions, id)
 			t.dirty = true
