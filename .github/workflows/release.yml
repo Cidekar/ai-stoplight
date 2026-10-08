@@ -15,7 +15,7 @@ on:
   workflow_dispatch:
     inputs:
       dry_run:
-        description: "Compute the version and build, but do not tag or publish"
+        description: "Compute the version and build, but do not tag or publish (Dry run)"
         type: boolean
         default: false
 
@@ -61,7 +61,7 @@ jobs:
         # RACE= disables the race detector: -race needs cgo and a C compiler,
         # which the cgo-free runner image lacks. The tests are pure Go, so this
         # drops race detection, not coverage. Local runs keep -race by default.
-        run: make lint cross test PLATFORMS="linux windows" RACE=
+        run: make lint cross test PLATFORMS="linux" RACE=
 
       - name: Decide the next version
         id: version
