@@ -116,26 +116,26 @@ jobs:
             echo "last=$last"
           } >> "$GITHUB_OUTPUT"
 
-      - name: Build the release binaries
-        run: |
-          set -euo pipefail
-          next="${{ steps.version.outputs.next }}"
-          mkdir -p dist
-          # Linux only for now, both common architectures. The binary name
-          # carries OS and arch so a release page lists them unambiguously.
-          #
-          # windows and darwin are omitted: darwin's BLE transport pulls in
-          # cbgo / CoreBluetooth, whose cgo bindings do not compile from this
-          # Linux runner, and windows is dropped until a build flow for it is
-          # added. Both need their own runner; this flow ships Linux.
-          # for pair in linux/amd64 linux/arm64; do
-          #   os="${pair%/*}"; arch="${pair#*/}"
-          #   out="dist/stoplight-${next}-${os}-${arch}"
-          #   echo "==> $out"
-          #   GOOS="$os" GOARCH="$arch" CGO_ENABLED=0 \
-          #     go build -trimpath -ldflags "-s -w -X main.version=${next}" -o "$out" .
-          # done
-          ls -la dist
+      # - name: Build the release binaries
+      #   run: |
+      #     set -euo pipefail
+      #     next="${{ steps.version.outputs.next }}"
+      #     mkdir -p dist
+      #     # Linux only for now, both common architectures. The binary name
+      #     # carries OS and arch so a release page lists them unambiguously.
+      #     #
+      #     # windows and darwin are omitted: darwin's BLE transport pulls in
+      #     # cbgo / CoreBluetooth, whose cgo bindings do not compile from this
+      #     # Linux runner, and windows is dropped until a build flow for it is
+      #     # added. Both need their own runner; this flow ships Linux.
+      #     # for pair in linux/amd64 linux/arm64; do
+      #     #   os="${pair%/*}"; arch="${pair#*/}"
+      #     #   out="dist/stoplight-${next}-${os}-${arch}"
+      #     #   echo "==> $out"
+      #     #   GOOS="$os" GOARCH="$arch" CGO_ENABLED=0 \
+      #     #     go build -trimpath -ldflags "-s -w -X main.version=${next}" -o "$out" .
+      #     # done
+      #     ls -la dist
 
       - name: Tag the release
         if: ${{ !inputs.dry_run }}
