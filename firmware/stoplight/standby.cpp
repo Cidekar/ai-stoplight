@@ -21,7 +21,7 @@ void Standby::noteActivity(uint32_t now) {
   // next update() clears active_ because the timer is now fresh.
 }
 
-bool Standby::update(uint32_t now, bool connected) {
+StandbyTransition Standby::update(uint32_t now, bool connected) {
   // A live BLE link is activity in its own right: a connected but quiet central
   // must not let the light blank between frames. Rearming here also means the
   // grace timer only ever counts from the moment the link actually went down.
@@ -35,19 +35,23 @@ bool Standby::update(uint32_t now, bool connected) {
 
   if (active_) {
     // Powered down. Activity rearmed the timer, so a fresh frame or a reconnect
-    // lifts standby. The caller does the actual wake (the next frame wakes the
-    // display and sets the lamp); this only reports that standby is over.
+    // lifts standby. Report the RESUME edge once so the caller re-asserts the
+    // lamp: the frame that rearmed the timer may carry no "color" key, and then
+    // the lamp would stay dark-by-accident until some later frame happened to
+    // carry a colour. The display wake is the frame's own job; only the lamp
+    // needs this edge.
     if (!graceExpired) {
       active_ = false;
+      return STANDBY_RESUMED;
     }
-    return false;
+    return STANDBY_NONE;
   }
 
   // Awake. Enter standby only once, on the iteration the grace window closes.
   if (graceExpired) {
     active_ = true;
-    return true;  // the caller clears the lamps and sleeps the panel now
+    return STANDBY_ENGAGED;  // the caller clears the lamps and sleeps the panel
   }
 
-  return false;
+  return STANDBY_NONE;
 }

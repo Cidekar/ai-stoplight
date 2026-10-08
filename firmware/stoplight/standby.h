@@ -43,6 +43,22 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+// StandbyTransition is what update() reports on the one iteration a state edge
+// happens, so the caller acts on each edge exactly once. The two edges are not
+// symmetric in what the caller does, which is why they are named rather than a
+// bare bool:
+//
+//   STANDBY_ENGAGED  the light just powered down: clear the lamps, sleep panel.
+//   STANDBY_RESUMED  the light just came back: re-assert the lamp, because the
+//                    frame that rearmed the timer may carry no "color" key and
+//                    then nothing else drives the lamp off COLOR_OFF. See the
+//                    note on lastAggregate in stoplight.ino.
+enum StandbyTransition : uint8_t {
+  STANDBY_NONE = 0,
+  STANDBY_ENGAGED,
+  STANDBY_RESUMED
+};
+
 // STANDBY_GRACE_MS is how long the link must be down AND silent before the
 // light powers down. Five seconds: a BLE supervision-timeout reconnect settles
 // well inside it, so an ordinary radio blip never reaches the lamps, while the
@@ -68,12 +84,14 @@ class Standby {
   // timer, so activity over serial keeps a BLE-disconnected light awake.
   void noteActivity(uint32_t now);
 
-  // update advances the state machine for one loop() iteration and returns
-  // true on the iteration that ENTERS standby, so the caller clears the lamps
-  // and sleeps the panel exactly once rather than every loop. `connected` is
-  // the BLE link state; a live link counts as activity. Non-blocking, and the
-  // elapsed-time maths is unsigned so it is correct across the millis() wrap.
-  bool update(uint32_t now, bool connected);
+  // update advances the state machine for one loop() iteration and returns the
+  // edge the iteration crossed, so the caller acts on ENTER and on RESUME
+  // exactly once rather than every loop. On STANDBY_ENGAGED the caller clears
+  // the lamps and sleeps the panel; on STANDBY_RESUMED it re-asserts the lamp
+  // (see the lastAggregate note in stoplight.ino). `connected` is the BLE link
+  // state; a live link counts as activity. Non-blocking, and the elapsed-time
+  // maths is unsigned so it is correct across the millis() wrap.
+  StandbyTransition update(uint32_t now, bool connected);
 
   // active reports whether the light is currently powered down.
   bool active() const { return active_; }

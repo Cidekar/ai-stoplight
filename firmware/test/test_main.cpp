@@ -2599,19 +2599,34 @@ void testBleLink() {
 void testStandby() {
   section("standby on link drop");
 
-  // engageStep mirrors loop() step 5 exactly: advance the state machine, and on
-  // the engage transition clear the lamps and sleep the panel. Returning the
-  // transition lets a test assert it fired exactly once.
-  auto engageStep = [](Standby* sb, Lamps* lamps, Display* display, uint32_t now,
-                       bool connected) -> bool {
-    if (sb->update(now, connected)) {
+  // standbyStep mirrors loop() step 5 exactly: advance the state machine and
+  // act on the edge it reports. On ENGAGE it clears the lamps and sleeps the
+  // panel; on RESUME it re-asserts the lamp from the cached aggregate, exactly
+  // as loop() does. It returns the raw transition so a test can count the edges
+  // and assert each fires exactly once. `lastAggregate` is the sketch's cache
+  // of the last driven colour, passed in so the resume branch can be exercised.
+  auto standbyStep = [](Standby* sb, Lamps* lamps, Display* display,
+                        Color lastAggregate, uint32_t now,
+                        bool connected) -> StandbyTransition {
+    StandbyTransition t = sb->update(now, connected);
+    if (t == STANDBY_ENGAGED) {
       lamps->set(COLOR_OFF);
       if (!display->asleep()) {
         display->sleep();
       }
-      return true;
+    } else if (t == STANDBY_RESUMED) {
+      lamps->set(lastAggregate);
     }
-    return false;
+    return t;
+  };
+
+  // engageStep keeps the old boolean shape for the engage-only cases below, so
+  // those read as before: true exactly on the iteration standby engages. It
+  // passes COLOR_OFF as the cache because none of these cases reaches resume.
+  auto engageStep = [&standbyStep](Standby* sb, Lamps* lamps, Display* display,
+                                   uint32_t now, bool connected) -> bool {
+    return standbyStep(sb, lamps, display, COLOR_OFF, now, connected) ==
+           STANDBY_ENGAGED;
   };
 
   // (1) and (4): after a disconnect and the full grace window with no frame,
@@ -2741,12 +2756,15 @@ void testStandby() {
                      &green),
           "the resume frame parses");
     lamps.set(green.color);          // the lamp follows the frame
+    Color lastAggregate = green.color;  // the sketch caches the driven aggregate
     display.applyFrame(green, resumeAt);  // applyFrame wakes the panel
     sb.noteActivity(resumeAt);
-    bool reEngaged = engageStep(&sb, &lamps, &display, resumeAt,
-                                /*connected=*/true);
+    StandbyTransition resumeEdge = standbyStep(&sb, &lamps, &display,
+                                               lastAggregate, resumeAt,
+                                               /*connected=*/true);
 
-    check(!reEngaged, "the resume iteration does not re-enter standby");
+    check(resumeEdge != STANDBY_ENGAGED,
+          "the resume iteration does not re-enter standby");
     check(!sb.active(), "standby lifted on reconnect");
     check(lamps.current() == COLOR_GREEN,
           "the lamp resumed from the next frame after reconnect");
@@ -2831,6 +2849,184 @@ void testStandby() {
     check(!engaged,
           "a serial-driven but BLE-disconnected light never enters standby");
     check(lamps.current() == COLOR_GREEN, "and keeps showing its colour");
+  }
+
+  // The engage edge fires EXACTLY ONCE. A bool accumulator hides a double
+  // engage; a counter does not. Standby engages on the iteration the grace
+  // window closes and must stay quiet every iteration after, while active_
+  // holds, so the sketch clears the lamps and sleeps the panel one time, not
+  // on every loop.
+  {
+    Lamps lamps;
+    lamps.begin();
+    Display display;
+    display.begin();
+    Standby sb;
+    sb.begin(0);
+    lamps.set(COLOR_RED);
+    sb.noteActivity(1000);
+
+    int engageCount = 0;
+    // Run well past the engage point and keep stepping with the link still
+    // down. Only the crossing iteration may report ENGAGED.
+    for (uint32_t t = 1000; t <= 1000 + STANDBY_GRACE_MS * 3; t += 250) {
+      if (standbyStep(&sb, &lamps, &display, COLOR_RED, t,
+                      /*connected=*/false) == STANDBY_ENGAGED) {
+        engageCount++;
+      }
+    }
+    checkInt((long)engageCount, 1, "standby engaged exactly once, not per loop");
+    check(sb.active(), "and standby stays active afterwards");
+  }
+
+  // A button press inside the grace window is activity, exactly like a frame:
+  // loop() step 2 calls noteActivity on a press. A user pressing the button on
+  // a BLE-disconnected light must hold standby off, so the screen the press
+  // just woke is not blanked out from under them. This drives a real Button and
+  // mirrors the short-press branch of loop().
+  {
+    Lamps lamps;
+    lamps.begin();
+    Display display;
+    display.begin();
+    Standby sb;
+    sb.begin(0);
+    lamps.set(COLOR_GREEN);
+    sb.noteActivity(0);
+
+    Button button;
+    button.begin();
+    slTestPinLevel[BUTTON_PIN] = HIGH;
+    button.update(0);
+
+    // A clean short press lands partway through the grace window, before
+    // standby would otherwise engage.
+    const uint32_t pressAt = STANDBY_GRACE_MS - 1000;
+    bool pressSeen = false;
+    bool engaged = false;
+    for (uint32_t t = 0; t <= STANDBY_GRACE_MS + 1000; t += 100) {
+      // Hold the button down for one debounce interval around pressAt, then
+      // release, which the Button reads as a short press.
+      if (t >= pressAt && t < pressAt + 200) {
+        slTestPinLevel[BUTTON_PIN] = LOW;
+      } else {
+        slTestPinLevel[BUTTON_PIN] = HIGH;
+      }
+      if (button.update(t) == BUTTON_SHORT_PRESS) {
+        pressSeen = true;
+        sb.noteActivity(t);  // loop() step 2: a press is activity
+      }
+      if (standbyStep(&sb, &lamps, &display, COLOR_GREEN, t,
+                      /*connected=*/false) == STANDBY_ENGAGED) {
+        engaged = true;
+      }
+    }
+    check(pressSeen, "the short press was seen inside the grace window");
+    check(!engaged,
+          "a button press rearmed the timer and held standby off");
+    check(lamps.current() == COLOR_GREEN,
+          "the lamp stayed lit through the press, not blanked");
+  }
+
+  // THE BLOCKER (issue #39, inverted). After standby, the FIRST frame on
+  // reconnect may carry NO "color" key: a sessions-only refresh, which the
+  // protocol explicitly allows. feedByte then wakes the display but never calls
+  // lamps.set(), and without the resume re-assert the lamp would sit dark by
+  // accident while the display shows sessions. The resume edge must drive the
+  // lamp to its truthful cached colour AND the display must wake.
+  {
+    Lamps lamps;
+    lamps.begin();
+    Display display;
+    display.begin();
+    Standby sb;
+    sb.begin(0);
+    slTestScreen.powerSave = false;
+
+    // Driven red, then the link drops and standby engages.
+    Frame red;
+    check(parseFrame("{\"color\":\"red\",\"sessions\":[{\"id\":\"a1\","
+                     "\"label\":\"one\",\"state\":\"needs you\","
+                     "\"color\":\"red\"}]}",
+                     &red),
+          "the red frame parses");
+    check(red.hasColor, "the red frame carries a colour");
+    lamps.set(red.color);
+    Color lastAggregate = red.color;  // the sketch caches the driven aggregate
+    display.applyFrame(red, 1000);
+    sb.noteActivity(1000);
+    for (uint32_t t = 1000; t <= 1000 + STANDBY_GRACE_MS; t += 250) {
+      standbyStep(&sb, &lamps, &display, lastAggregate, t, /*connected=*/false);
+    }
+    check(sb.active(), "standby engaged");
+    check(lamps.current() == COLOR_OFF, "the lamp is dark in standby");
+    check(display.asleep(), "the panel is asleep in standby");
+
+    // Reconnect. The FIRST frame is sessions-only: a label refresh whose
+    // aggregate did not change, so the relay sent no "color" key. This is the
+    // exact legal frame that used to leave the lamp dark.
+    const uint32_t resumeAt = 1000 + STANDBY_GRACE_MS + 1000;
+    Frame refresh;
+    check(parseFrame("{\"sessions\":[{\"id\":\"a1\","
+                     "\"label\":\"one-renamed\",\"state\":\"needs you\","
+                     "\"color\":\"red\"}]}",
+                     &refresh),
+          "the sessions-only resume frame parses");
+    check(!refresh.hasColor,
+          "the resume frame carries NO top-level colour, as the protocol allows");
+
+    // One loop() iteration, exactly as the sketch runs it. feedByte applies the
+    // frame: no top-level colour, so it does NOT touch the lamp, only the
+    // display. lastAggregate is unchanged (still red). noteActivity rearms the
+    // timer. The standby step then reports RESUME and re-asserts the lamp.
+    if (refresh.hasColor) {
+      lamps.set(refresh.color);
+      lastAggregate = refresh.color;
+    }
+    display.applyFrame(refresh, resumeAt);  // wakes the panel
+    sb.noteActivity(resumeAt);
+    StandbyTransition t = standbyStep(&sb, &lamps, &display, lastAggregate,
+                                      resumeAt, /*connected=*/true);
+
+    checkInt((long)t, (long)STANDBY_RESUMED,
+             "the standby step reported the RESUME edge");
+    check(!sb.active(), "standby lifted on the sessions-only frame");
+    check(lamps.current() == COLOR_RED,
+          "the lamp was driven to its truthful resume colour, not left dark");
+    checkInt((long)slTestLedcDuty[LAMP_PIN_RED], LAMP_DUTY,
+             "the red LED is lit again on resume");
+    check(!display.asleep(), "the display woke on the sessions-only frame");
+    check(!slTestScreen.powerSave, "the panel powered back on");
+  }
+
+  // Engage while the display is already asleep. The idle-blank path can sleep
+  // the panel before standby engages, and the engage branch guards on
+  // !display.asleep() so it does not double-sleep. The lamp must still clear.
+  {
+    Lamps lamps;
+    lamps.begin();
+    Display display;
+    display.begin();
+    Standby sb;
+    sb.begin(0);
+    lamps.set(COLOR_YELLOW);
+    sb.noteActivity(0);
+
+    // The screen blanked already, as the SCREEN_IDLE_MS path would do.
+    display.sleep();
+    check(display.asleep(), "the panel is asleep before standby engages");
+
+    bool engaged = false;
+    for (uint32_t t = 0; t <= STANDBY_GRACE_MS; t += 250) {
+      if (standbyStep(&sb, &lamps, &display, COLOR_YELLOW, t,
+                      /*connected=*/false) == STANDBY_ENGAGED) {
+        engaged = true;
+      }
+    }
+    check(engaged, "standby still engages with the panel already asleep");
+    check(lamps.current() == COLOR_OFF,
+          "the lamp cleared even though the panel was already asleep");
+    check(display.asleep(), "and the panel stayed asleep");
   }
 }
 
