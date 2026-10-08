@@ -15,7 +15,7 @@ on:
   workflow_dispatch:
     inputs:
       dry_run:
-        description: "Compute the version and build, but do not tag or publish"
+        description: "Compute the version and build, but do not tag or publish (Dry run)"
         type: boolean
         default: false
 
@@ -61,7 +61,7 @@ jobs:
         # RACE= disables the race detector: -race needs cgo and a C compiler,
         # which the cgo-free runner image lacks. The tests are pure Go, so this
         # drops race detection, not coverage. Local runs keep -race by default.
-        run: make lint cross test PLATFORMS="linux windows" RACE=
+        run: make lint cross test PLATFORMS="linux" RACE=
 
       - name: Decide the next version
         id: version
@@ -120,19 +120,16 @@ jobs:
           set -euo pipefail
           next="${{ steps.version.outputs.next }}"
           mkdir -p dist
-          # The platforms the service package has a manager for, both common
-          # architectures. The binary name carries OS and arch so a release
-          # page lists them unambiguously.
+          # Linux only for now, both common architectures. The binary name
+          # carries OS and arch so a release page lists them unambiguously.
           #
-          # darwin is omitted for the same reason the test gate pins cross to
-          # linux+windows: the BLE transport pulls in cbgo / CoreBluetooth,
-          # whose cgo bindings do not compile from this Linux runner even with
-          # CGO_ENABLED=0 -- the build fails on undefined CoreBluetooth types.
-          # darwin binaries need a macOS runner, which this flow does not have.
-          for pair in linux/amd64 linux/arm64 windows/amd64 windows/arm64; do
+          # windows and darwin are omitted: darwin's BLE transport pulls in
+          # cbgo / CoreBluetooth, whose cgo bindings do not compile from this
+          # Linux runner, and windows is dropped until a build flow for it is
+          # added. Both need their own runner; this flow ships Linux.
+          for pair in linux/amd64 linux/arm64; do
             os="${pair%/*}"; arch="${pair#*/}"
             out="dist/stoplight-${next}-${os}-${arch}"
-            [ "$os" = "windows" ] && out="${out}.exe"
             echo "==> $out"
             GOOS="$os" GOARCH="$arch" CGO_ENABLED=0 \
               go build -trimpath -ldflags "-s -w -X main.version=${next}" -o "$out" .
