@@ -43,23 +43,22 @@ jobs:
           go-version-file: go.mod
           cache: false
 
-      # - name: Run the test gate
+      - name: Run the test gate
         # The same gate contributors run, minus test-linux: that target needs
         # Docker to run the cross-compiled Linux binaries in a container, which
         # the runner may not have. cross still compiles every package for every
         # platform, so a platform-specific build break is still caught.
         #
-        # PLATFORMS is pinned to linux+windows here: the darwin backend of
+        # PLATFORMS is pinned to linux: the darwin backend of
         # tinygo.org/x/bluetooth (cbgo / CoreBluetooth) only compiles on a real
         # macOS host, so cross-vetting GOOS=darwin from this Linux runner fails
-        # on undefined CoreBluetooth types. darwin is covered by a separate
-        # macOS-runner flow. The Makefile default stays linux windows darwin so
-        # local macOS builds still cross-check every platform.
+        # on undefined CoreBluetooth types. The Makefile default stays
+        # linux windows darwin so local macOS builds still cross-check everything.
         #
         # RACE= disables the race detector: -race needs cgo and a C compiler,
         # which the cgo-free runner image lacks. The tests are pure Go, so this
         # drops race detection, not coverage. Local runs keep -race by default.
-        # run: make lint cross test PLATFORMS="linux" RACE=
+        run: make lint cross test PLATFORMS="linux" RACE=
 
       - name: Decide the next version
         id: version
@@ -156,7 +155,11 @@ jobs:
           # --notes-start-tag anchors it at the previous release so the notes
           # cover exactly this release's range; omitted on the first release,
           # where there is no earlier tag to start from.
-          args=(release create "$next" dist/* --title "$next" --generate-notes)
+          #
+          # No binary assets for now: the build step above is disabled until the
+          # Pi/darwin binary story is sorted, so this cuts a tag + changelog only.
+          # Re-add dist/* here once the build step is restored.
+          args=(release create "$next" --title "$next" --generate-notes)
           if [ -n "$last" ]; then
             args+=(--notes-start-tag "$last")
           fi
