@@ -34,7 +34,7 @@ jobs:
           exit 1
 
       - name: Check out full history
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           # The version decision reads every commit since the last tag, and
           # tags themselves must be present, so a shallow clone will not do.
@@ -44,6 +44,7 @@ jobs:
         uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
+          cache: false
 
       # - name: Run the test gate
         # The same gate contributors run, minus test-linux: that target needs
