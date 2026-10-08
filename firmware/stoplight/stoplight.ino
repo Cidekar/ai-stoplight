@@ -29,7 +29,6 @@
 #include "display.h"
 #include "lamps.h"
 #include "protocol.h"
-#include "standby.h"
 
 // I2C for the onboard panel. These are not the core's default pins, so Wire
 // must be told about them explicitly before the display starts.
@@ -46,7 +45,6 @@ Lamps lamps;
 Display display;
 Button button;
 BleLink ble;
-Standby standby;
 
 // ONE reader for BOTH transports, which is the point.
 //
@@ -67,26 +65,6 @@ LineReader reader;
 Frame frame;
 
 uint32_t lastFrameAt = 0;
-
-// lastAggregate is the last aggregate colour actually driven onto the lamps,
-// i.e. the last frame.color applied below. It exists for the standby RESUME
-// edge: when the light comes back, the frame that rearmed the timer may carry
-// no "color" key (a sessions-only refresh, which the protocol explicitly
-// allows), so feedByte wakes the display but never calls lamps.set(). The lamp
-// would then sit dark-by-accident until some later frame happened to carry a
-// colour. loop() re-asserts lamps.set(lastAggregate) on RESUME to close that
-// gap. See loop() step 5.
-//
-// WHY THIS VALUE IS TRUTHFUL, NOT A STALE RESURRECTION. The worry #39 fights is
-// a lamp showing a colour that is no longer true. That cannot happen here: the
-// relay transmits only on CHANGE, so any colour change that occurred while the
-// light was in standby arrives as a fresh frame on reconnect, and that frame,
-// when it carries "color", updates lastAggregate BELOW before the standby step
-// runs in the SAME loop() iteration. A sessions-only resume frame means the
-// relay is affirming the aggregate did NOT change, so the cached colour is
-// still the true one. Boot value is COLOR_OFF: nothing is running until the
-// first frame says otherwise, which is the truthful pre-frame state.
-Color lastAggregate = COLOR_OFF;
 
 void setup() {
   // The CDC receive buffer must hold a whole frame, and the default does not.
@@ -123,13 +101,7 @@ void setup() {
   // decision made at flash time about something discovered at run time.
   ble.begin();
 
-  const uint32_t now = millis();
-  lastFrameAt = now;
-
-  // Arm the standby grace timer at boot. A board powered on with no central
-  // ever present powers down once the grace window passes, rather than holding
-  // a dark-but-live light forever. See standby.h, issue #39.
-  standby.begin(now);
+  lastFrameAt = millis();
 }
 
 // feedByte hands one byte to the reader and acts on a completed line. It is
@@ -148,7 +120,6 @@ static bool feedByte(char c, uint32_t now) {
     Color salvaged;
     if (reader.overflowColor(&salvaged)) {
       lamps.set(salvaged);
-      lastAggregate = salvaged;  // a salvaged aggregate is a driven colour too
       return true;
     }
     return false;
@@ -166,7 +137,6 @@ static bool feedByte(char c, uint32_t now) {
   // absent means "no instruction", not "off".
   if (frame.hasColor) {
     lamps.set(frame.color);
-    lastAggregate = frame.color;  // the truthful colour to resume to; see above
   }
 
   // THE SCREEN. Separately, and it cannot reach back to the lamps.
@@ -194,9 +164,6 @@ void loop() {
     }
     if (feedByte((char)c, now)) {
       lastFrameAt = now;
-      // A frame over either transport is what keeps the light out of standby,
-      // so a serial-driven board stays awake even though BLE never connects.
-      standby.noteActivity(now);
     }
   }
 
@@ -207,7 +174,6 @@ void loop() {
     }
     if (feedByte((char)c, now)) {
       lastFrameAt = now;
-      standby.noteActivity(now);
     }
   }
 
@@ -223,12 +189,10 @@ void loop() {
     case BUTTON_SHORT_PRESS:
       display.togglePin(now);
       lastFrameAt = now;
-      standby.noteActivity(now);
       break;
     case BUTTON_LONG_PRESS:
       display.advance(now);
       lastFrameAt = now;
-      standby.noteActivity(now);
       break;
     default:
       break;
@@ -241,36 +205,5 @@ void loop() {
   // correct across the millis() rollover at about 49 days.
   if (!display.asleep() && (uint32_t)(now - lastFrameAt) >= SCREEN_IDLE_MS) {
     display.sleep();
-  }
-
-  // 5. Standby. When the BLE link is down AND no frame has arrived for the
-  // grace window, the light is no longer being told what to show, so power
-  // down the lamps and the panel rather than holding a stale colour forever.
-  // See standby.h, issue #39.
-  //
-  // ENGAGE: the lamps are cleared to COLOR_OFF, not left on their last colour:
-  // a lamp that is no longer true is worse than a dark one, and it is the LED
-  // current and life this exists to stop. The panel is slept too, if the idle
-  // blank above has not already done it.
-  //
-  // RESUME: re-assert the lamp from lastAggregate. The frame that rearmed the
-  // timer this iteration wakes the display, but it may carry NO "color" key (a
-  // sessions-only refresh the protocol allows), in which case feedByte never
-  // called lamps.set() and the lamp would stay dark-by-accident. Driving it to
-  // lastAggregate here closes that gap. It is idempotent when the frame already
-  // set the colour, and truthful when it did not: see the lastAggregate note
-  // above for why the cached colour is the right one to resume to.
-  switch (standby.update(now, ble.connected())) {
-    case STANDBY_ENGAGED:
-      lamps.set(COLOR_OFF);
-      if (!display.asleep()) {
-        display.sleep();
-      }
-      break;
-    case STANDBY_RESUMED:
-      lamps.set(lastAggregate);
-      break;
-    case STANDBY_NONE:
-      break;
   }
 }

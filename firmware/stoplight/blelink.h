@@ -62,11 +62,9 @@ class BleLink {
   // both transports.
   int read();
 
-  // connected reports whether a central is currently connected. Two callers:
-  // the re-advertise decision, and standby, which treats a live link as
-  // activity so a connected-but-quiet central does not blank the light and so
-  // the grace timer only counts from the moment the link actually drops. Frame
-  // handling itself still does not depend on it. See standby.{h,cpp}.
+  // connected reports whether a central is currently connected. Used only
+  // to decide whether to re-advertise; nothing about frame handling depends
+  // on it.
   bool connected() const { return connected_; }
 
   // onConnect and onDisconnect are called from the stack's task. They are
