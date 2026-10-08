@@ -30,6 +30,7 @@
 #include "display.h"
 #include "lamps.h"
 #include "protocol.h"
+#include "standby.h"
 
 namespace {
 
@@ -2581,6 +2582,258 @@ void testBleLink() {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Standby when the link drops (issue #39).
+//
+// A device left powered on with no central connected held its last lamp colour
+// for ten hours. When the BLE link is down AND no frame has arrived for the
+// grace window, the light must clear the lamps to COLOR_OFF and sleep the
+// panel, and come straight back on a reconnect.
+//
+// loop() does standby in one statement: if standby.update() reports the engage
+// transition, it clears the lamps and sleeps the display. These checks drive
+// the same state machine against real Lamps and Display instances and assert on
+// what the hardware actually did, so the lamp power-down and the OLED sleep are
+// covered, not just the predicate.
+// ---------------------------------------------------------------------------
+void testStandby() {
+  section("standby on link drop");
+
+  // engageStep mirrors loop() step 5 exactly: advance the state machine, and on
+  // the engage transition clear the lamps and sleep the panel. Returning the
+  // transition lets a test assert it fired exactly once.
+  auto engageStep = [](Standby* sb, Lamps* lamps, Display* display, uint32_t now,
+                       bool connected) -> bool {
+    if (sb->update(now, connected)) {
+      lamps->set(COLOR_OFF);
+      if (!display->asleep()) {
+        display->sleep();
+      }
+      return true;
+    }
+    return false;
+  };
+
+  // (1) and (4): after a disconnect and the full grace window with no frame,
+  // the lamps go COLOR_OFF and the OLED standby path is invoked.
+  {
+    Lamps lamps;
+    lamps.begin();
+    Display display;
+    display.begin();
+    Standby sb;
+
+    // The light is driven and connected, then shows red.
+    sb.begin(0);
+    slTestScreen.powerSave = false;
+    Frame f;
+    check(parseFrame("{\"color\":\"red\",\"sessions\":[{\"id\":\"a1\","
+                     "\"label\":\"one\",\"state\":\"needs you\","
+                     "\"color\":\"red\"}]}",
+                     &f),
+          "the red frame parses");
+    lamps.set(f.color);
+    display.applyFrame(f, 1000);
+    sb.noteActivity(1000);
+    check(lamps.current() == COLOR_RED, "the lamp is red while driven");
+
+    // The link drops at t=1000. While connected() was true the timer rearmed,
+    // so the grace window is measured from the drop.
+    bool engaged = false;
+    for (uint32_t t = 1000; t <= 1000 + STANDBY_GRACE_MS; t += 250) {
+      if (engageStep(&sb, &lamps, &display, t, /*connected=*/false)) {
+        engaged = true;
+      }
+    }
+    check(engaged, "standby engaged after the link dropped past the grace");
+    check(sb.active(), "the state machine reports standby active");
+    check(lamps.current() == COLOR_OFF,
+          "the lamps cleared to COLOR_OFF: the stuck-lamp defect is fixed");
+    checkInt((long)slTestLedcDuty[LAMP_PIN_RED], 0, "the red LED is dark");
+    check(display.asleep(), "the OLED standby path was invoked on disconnect");
+    check(slTestScreen.powerSave, "the panel powered down");
+  }
+
+  // (2): a sub-grace blip does not blank. The link drops and comes back inside
+  // the grace window, so the lamps never go off and the panel never sleeps.
+  {
+    Lamps lamps;
+    lamps.begin();
+    Display display;
+    display.begin();
+    Standby sb;
+    sb.begin(0);
+    slTestScreen.powerSave = false;
+
+    Frame f;
+    check(parseFrame("{\"color\":\"green\",\"sessions\":[{\"id\":\"a1\","
+                     "\"label\":\"one\",\"state\":\"working\","
+                     "\"color\":\"green\"}]}",
+                     &f),
+          "the green frame parses");
+    lamps.set(f.color);
+    display.applyFrame(f, 1000);
+    sb.noteActivity(1000);
+
+    // Down for less than the grace window.
+    const uint32_t blipEnds = 1000 + STANDBY_GRACE_MS - 250;
+    bool engaged = false;
+    for (uint32_t t = 1000; t < blipEnds; t += 250) {
+      if (engageStep(&sb, &lamps, &display, t, /*connected=*/false)) {
+        engaged = true;
+      }
+    }
+    check(!engaged, "a sub-grace blip does not enter standby");
+    check(lamps.current() == COLOR_GREEN,
+          "the lamp stayed green through the blip: no flicker off");
+    check(!display.asleep(), "the panel stayed awake through the blip");
+
+    // The link comes back and a fresh frame arrives. update() with connected
+    // true keeps the timer rearmed, so standby never fires.
+    sb.noteActivity(blipEnds);
+    for (uint32_t t = blipEnds; t <= blipEnds + STANDBY_GRACE_MS * 2;
+         t += 250) {
+      engageStep(&sb, &lamps, &display, t, /*connected=*/true);
+    }
+    check(!sb.active(), "a reconnected link never enters standby");
+    check(lamps.current() == COLOR_GREEN, "and the lamp is still green");
+  }
+
+  // (3): reconnect resumes driving the lamps. The light goes into standby, then
+  // a frame arrives after the reconnect; the lamp follows the frame and the
+  // panel wakes, exactly as loop() does it (the frame drives lamps and display,
+  // and standby.update lifts itself once the timer is rearmed).
+  {
+    Lamps lamps;
+    lamps.begin();
+    Display display;
+    display.begin();
+    Standby sb;
+    sb.begin(0);
+    slTestScreen.powerSave = false;
+
+    Frame red;
+    check(parseFrame("{\"color\":\"red\",\"sessions\":[{\"id\":\"a1\","
+                     "\"label\":\"one\",\"state\":\"needs you\","
+                     "\"color\":\"red\"}]}",
+                     &red),
+          "the red frame parses");
+    lamps.set(red.color);
+    display.applyFrame(red, 1000);
+    sb.noteActivity(1000);
+
+    // Drop and run past the grace: standby engages.
+    for (uint32_t t = 1000; t <= 1000 + STANDBY_GRACE_MS; t += 250) {
+      engageStep(&sb, &lamps, &display, t, /*connected=*/false);
+    }
+    check(sb.active(), "standby engaged");
+    check(lamps.current() == COLOR_OFF, "the lamp is off in standby");
+    check(display.asleep(), "the panel is asleep in standby");
+
+    // Reconnect and a fresh green frame. This is one loop() iteration: the
+    // frame drives the lamp and wakes the display, noteActivity rearms the
+    // timer, and the standby step then lifts itself rather than re-engaging.
+    const uint32_t resumeAt = 1000 + STANDBY_GRACE_MS + 1000;
+    Frame green;
+    check(parseFrame("{\"color\":\"green\",\"sessions\":[{\"id\":\"a1\","
+                     "\"label\":\"one\",\"state\":\"working\","
+                     "\"color\":\"green\"}]}",
+                     &green),
+          "the resume frame parses");
+    lamps.set(green.color);          // the lamp follows the frame
+    display.applyFrame(green, resumeAt);  // applyFrame wakes the panel
+    sb.noteActivity(resumeAt);
+    bool reEngaged = engageStep(&sb, &lamps, &display, resumeAt,
+                                /*connected=*/true);
+
+    check(!reEngaged, "the resume iteration does not re-enter standby");
+    check(!sb.active(), "standby lifted on reconnect");
+    check(lamps.current() == COLOR_GREEN,
+          "the lamp resumed from the next frame after reconnect");
+    check(!display.asleep(), "the panel woke on the resume frame");
+    check(!slTestScreen.powerSave, "the panel powered back on");
+  }
+
+  // Never-connected-at-startup is the same path: a board powered on with no
+  // central ever present powers down once the grace window passes, rather than
+  // holding a dark-but-live light forever.
+  {
+    Lamps lamps;
+    lamps.begin();
+    Display display;
+    display.begin();
+    Standby sb;
+    sb.begin(0);  // armed at boot, never connected, never a frame
+
+    bool engaged = false;
+    for (uint32_t t = 0; t <= STANDBY_GRACE_MS; t += 250) {
+      if (engageStep(&sb, &lamps, &display, t, /*connected=*/false)) {
+        engaged = true;
+      }
+    }
+    check(engaged, "a never-connected light powers down after the grace");
+    check(lamps.current() == COLOR_OFF, "its lamps are off");
+    check(display.asleep(), "its panel is asleep");
+  }
+
+  // The grace timer survives the millis() rollover. A drop that straddles the
+  // wrap must still power down after exactly the grace window, not stall for 49
+  // days, because the elapsed-time test uses unsigned subtraction.
+  {
+    Lamps lamps;
+    lamps.begin();
+    Display display;
+    display.begin();
+    Standby sb;
+
+    // Last driven just before the wrap.
+    const uint32_t before = 0xFFFFFF00u;
+    sb.begin(before);
+    lamps.set(COLOR_YELLOW);
+    sb.noteActivity(before);
+
+    bool engaged = false;
+    // Step from just before the wrap to just past before + grace, which wraps
+    // through zero partway along.
+    for (uint32_t dt = 0; dt <= STANDBY_GRACE_MS; dt += 100) {
+      if (engageStep(&sb, &lamps, &display, before + dt, /*connected=*/false)) {
+        engaged = true;
+      }
+    }
+    check(engaged, "standby engages across the millis() rollover");
+    check(lamps.current() == COLOR_OFF, "the lamp cleared across the wrap");
+  }
+
+  // noteActivity alone keeps a disconnected-but-serial-driven light awake: the
+  // relay can drive the light over the cable while BLE never connects, and that
+  // must not blank it. update() is called with connected=false throughout; the
+  // steady stream of activity is the only thing holding standby off.
+  {
+    Lamps lamps;
+    lamps.begin();
+    Display display;
+    display.begin();
+    Standby sb;
+    sb.begin(0);
+    lamps.set(COLOR_GREEN);
+
+    bool engaged = false;
+    for (uint32_t t = 0; t <= STANDBY_GRACE_MS * 4; t += 250) {
+      // A frame arrives every grace-window-minus-a-bit, as a live serial feed
+      // would: enough to keep rearming the timer.
+      if (t % (STANDBY_GRACE_MS - 500) == 0) {
+        sb.noteActivity(t);
+      }
+      if (engageStep(&sb, &lamps, &display, t, /*connected=*/false)) {
+        engaged = true;
+      }
+    }
+    check(!engaged,
+          "a serial-driven but BLE-disconnected light never enters standby");
+    check(lamps.current() == COLOR_GREEN, "and keeps showing its colour");
+  }
+}
+
 int main() {
   printf("stoplight firmware host checks\n\n");
 
@@ -2596,6 +2849,7 @@ int main() {
   testStringHandling();
   testButton();
   testBleLink();
+  testStandby();
 
   printf("\n%d checks, %d failures\n", gChecks, gFailures);
   if (gFailures != 0) {

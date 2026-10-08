@@ -29,6 +29,7 @@
 #include "display.h"
 #include "lamps.h"
 #include "protocol.h"
+#include "standby.h"
 
 // I2C for the onboard panel. These are not the core's default pins, so Wire
 // must be told about them explicitly before the display starts.
@@ -45,6 +46,7 @@ Lamps lamps;
 Display display;
 Button button;
 BleLink ble;
+Standby standby;
 
 // ONE reader for BOTH transports, which is the point.
 //
@@ -101,7 +103,13 @@ void setup() {
   // decision made at flash time about something discovered at run time.
   ble.begin();
 
-  lastFrameAt = millis();
+  const uint32_t now = millis();
+  lastFrameAt = now;
+
+  // Arm the standby grace timer at boot. A board powered on with no central
+  // ever present powers down once the grace window passes, rather than holding
+  // a dark-but-live light forever. See standby.h, issue #39.
+  standby.begin(now);
 }
 
 // feedByte hands one byte to the reader and acts on a completed line. It is
@@ -164,6 +172,9 @@ void loop() {
     }
     if (feedByte((char)c, now)) {
       lastFrameAt = now;
+      // A frame over either transport is what keeps the light out of standby,
+      // so a serial-driven board stays awake even though BLE never connects.
+      standby.noteActivity(now);
     }
   }
 
@@ -174,6 +185,7 @@ void loop() {
     }
     if (feedByte((char)c, now)) {
       lastFrameAt = now;
+      standby.noteActivity(now);
     }
   }
 
@@ -189,10 +201,12 @@ void loop() {
     case BUTTON_SHORT_PRESS:
       display.togglePin(now);
       lastFrameAt = now;
+      standby.noteActivity(now);
       break;
     case BUTTON_LONG_PRESS:
       display.advance(now);
       lastFrameAt = now;
+      standby.noteActivity(now);
       break;
     default:
       break;
@@ -205,5 +219,23 @@ void loop() {
   // correct across the millis() rollover at about 49 days.
   if (!display.asleep() && (uint32_t)(now - lastFrameAt) >= SCREEN_IDLE_MS) {
     display.sleep();
+  }
+
+  // 5. Standby. When the BLE link is down AND no frame has arrived for the
+  // grace window, the light is no longer being told what to show, so power
+  // down the lamps and the panel rather than holding a stale colour forever.
+  // See standby.h, issue #39.
+  //
+  // The lamps are cleared to COLOR_OFF, not left on their last colour: a lamp
+  // that is no longer true is worse than a dark one, and it is the LED current
+  // and life this exists to stop. The panel is slept too, if the idle blank
+  // above has not already done it. Reconnecting needs nothing here: the next
+  // frame wakes the display and drives the lamp from its aggregate, and
+  // standby.update() lifts itself the moment activity rearms the timer.
+  if (standby.update(now, ble.connected())) {
+    lamps.set(COLOR_OFF);
+    if (!display.asleep()) {
+      display.sleep();
+    }
   }
 }
