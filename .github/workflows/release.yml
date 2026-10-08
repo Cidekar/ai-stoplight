@@ -44,6 +44,13 @@ jobs:
         uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
+      - name: Ensure make is present
+        run: |
+          set -euo pipefail
+          if ! command -v make >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends make
+          fi
 
       - name: Run the test gate
         # The same gate contributors run, minus test-linux: that target needs
