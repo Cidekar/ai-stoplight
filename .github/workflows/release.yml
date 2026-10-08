@@ -1,170 +1,126 @@
-# Release flow. Manual only, main only.
+# Stoplight development tasks.
 #
-# This is a small semantic-release: it reads Conventional Commit prefixes
-# since the last tag, decides the next version, builds the binaries, and cuts
-# a GitHub Release with auto-generated notes. There is no node toolchain and
-# no third-party action doing the versioning — the whole decision is the
-# shell step below, so what ships is what you can read here.
+# `make check` is the one command to run before opening a pull request. It
+# is also what CI runs, so a green check locally means a green check there.
 #
-# Dispatch it from the Actions tab. It refuses to run on any ref but main, so
-# a release always reflects what landed on the default branch. Merge dev into
-# main first, then run this.
-name: release
+# Cross-platform coverage is the reason this file exists. The service
+# package builds one manager per platform behind a build tag, so a plain
+# `go test ./...` on macOS never compiles the Linux or Windows managers.
+# Code that is never compiled is code that is never tested, and a failing
+# test in a tagged file looks exactly like a passing one. `make cross`
+# compiles every package for every platform, and `make test-linux` runs
+# the Linux tests for real.
 
-on:
-  workflow_dispatch:
-    inputs:
-      dry_run:
-        description: "Compute the version and build, but do not tag or publish"
-        type: boolean
-        default: false
+GO ?= go
+BINARY ?= stoplight
+# The race detector needs cgo and a C compiler. Default on for local runs;
+# set RACE= (empty) to disable where cgo is unavailable, e.g. a cgo-free CI
+# runner. The tests themselves are pure Go, so dropping -race loses detection,
+# not coverage.
+RACE ?= -race
+# The platforms the service package has a manager for. unsupported.go
+# covers the rest, so these are the ones worth compiling.
+PLATFORMS ?= linux windows darwin
+# A small image with a libc the cgo-free test binaries run against.
+LINUX_IMAGE ?= alpine:3.20
 
-# Tagging and creating a release both write to the repo.
-permissions:
-  contents: write
+.DEFAULT_GOAL := help
 
-jobs:
-  release:
-    runs-on: cidekar-anvil
-    steps:
-      - name: Refuse to run off main
-        if: github.ref != 'refs/heads/main'
-        run: |
-          echo "::error::release runs on main only; this ref is ${{ github.ref }}"
-          exit 1
+.PHONY: help
+help: ## List the available targets
+	@grep -hE '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) \
+		| awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-14s\033[0m %s\n", $$1, $$2}'
 
-      - name: Check out full history
-        uses: actions/checkout@v4
-        with:
-          # The version decision reads every commit since the last tag, and
-          # tags themselves must be present, so a shallow clone will not do.
-          fetch-depth: 0
+.PHONY: build
+build: ## Build the binary for this platform
+	$(GO) build -o $(BINARY) .
 
-      - name: Set up Go
-        uses: actions/setup-go@v5
-        with:
-          go-version-file: go.mod
+.PHONY: test
+test: ## Run the tests for this platform
+	$(GO) test $(RACE) -count=1 -timeout 300s ./...
 
-      - name: Run the test gate
-        # The same gate contributors run, minus test-linux: that target needs
-        # Docker to run the cross-compiled Linux binaries in a container, which
-        # the runner may not have. cross still compiles every package for every
-        # platform, so a platform-specific build break is still caught.
-        #
-        # PLATFORMS is pinned to linux+windows here: the darwin backend of
-        # tinygo.org/x/bluetooth (cbgo / CoreBluetooth) only compiles on a real
-        # macOS host, so cross-vetting GOOS=darwin from this Linux runner fails
-        # on undefined CoreBluetooth types. darwin is covered by a separate
-        # macOS-runner flow. The Makefile default stays linux windows darwin so
-        # local macOS builds still cross-check every platform.
-        run: make lint cross test PLATFORMS="linux windows"
+.PHONY: lint
+lint: vet fmtcheck ## Run go vet and the formatting check
 
-      - name: Decide the next version
-        id: version
-        run: |
-          set -euo pipefail
+.PHONY: vet
+vet: ## Run go vet for every platform
+	$(GO) vet ./...
+	@for os in $(PLATFORMS); do \
+		echo "go vet GOOS=$$os"; \
+		GOOS=$$os $(GO) vet ./... || exit 1; \
+	done
 
-          # The last release tag, or empty for the very first release.
-          last="$(git tag --list 'v*' --sort=-v:refname | head -n1 || true)"
+# gofmt exits zero whether or not it found anything, so the output is what
+# decides. An unformatted file must fail the build rather than scroll past.
+.PHONY: fmtcheck
+fmtcheck: ## Fail if any file is not gofmt clean
+	@out=$$(gofmt -l .); \
+	if [ -n "$$out" ]; then \
+		echo "these files are not gofmt clean:"; \
+		echo "$$out"; \
+		echo "run: gofmt -w ."; \
+		exit 1; \
+	fi
+	@echo "gofmt: clean"
 
-          if [ -z "$last" ]; then
-            # No tag yet. Start the line at v0.1.0 rather than deriving a bump
-            # from nothing. This is the one version the commits do not decide.
-            next="v0.1.0"
-            range=""
-            echo "no previous tag; first release is $next"
-          else
-            range="${last}..HEAD"
-            # What kind of bump do the commits since $last call for? Conventional
-            # Commits: a breaking change is major, a feat is minor, anything else
-            # (fix, perf, refactor, ...) is patch. A '!' before the ':' or a
-            # 'BREAKING CHANGE' footer marks a break.
-            log="$(git log --format='%B' "$range")"
-            bump="patch"
-            if printf '%s' "$log" | grep -qE '^[a-z]+(\([^)]+\))?!:' \
-              || printf '%s' "$log" | grep -q 'BREAKING CHANGE'; then
-              bump="major"
-            elif printf '%s' "$log" | grep -qE '^feat(\([^)]+\))?:'; then
-              bump="minor"
-            fi
+.PHONY: fmt
+fmt: ## Format every file in place
+	gofmt -w .
 
-            ver="${last#v}"
-            major="${ver%%.*}"; rest="${ver#*.}"
-            minor="${rest%%.*}"; patch="${rest#*.}"
-            case "$bump" in
-              major) major=$((major + 1)); minor=0; patch=0 ;;
-              minor) minor=$((minor + 1)); patch=0 ;;
-              patch) patch=$((patch + 1)) ;;
-            esac
-            next="v${major}.${minor}.${patch}"
-            echo "last=$last bump=$bump next=$next"
-          fi
+# Building proves the platform code compiles. Compiling the tests proves
+# the tagged _test.go files compile too, which a build alone does not
+# reach. Neither runs the Linux tests: that is test-linux.
+.PHONY: cross
+cross: ## Build and compile tests for every platform
+	@for os in $(PLATFORMS); do \
+		echo "==> GOOS=$$os build"; \
+		GOOS=$$os $(GO) build -o /dev/null . || exit 1; \
+		echo "==> GOOS=$$os test compile"; \
+		for pkg in $$($(GO) list ./...); do \
+			GOOS=$$os $(GO) test -c -o /dev/null $$pkg || exit 1; \
+		done; \
+	done
+	@echo "cross: every package builds and every test compiles for $(PLATFORMS)"
 
-          # Guard: nothing new to release.
-          if [ -n "$range" ] && [ -z "$(git log --oneline "$range")" ]; then
-            echo "::error::no commits since $last; nothing to release"
-            exit 1
-          fi
+# The Linux service tests only ever execute here. Cross-compiling the test
+# binary and running it in a container is what turns the systemd manager
+# from "it compiles" into "it passes".
+#
+# Docker is optional: a contributor without it gets a clear skip rather
+# than a failure, because `make check` must stay runnable on a laptop.
+.PHONY: test-linux
+test-linux: ## Run the Linux tests in a container, if Docker is available
+	@if ! docker info >/dev/null 2>&1; then \
+		echo "SKIP test-linux: Docker is not available."; \
+		echo "  The Linux-only code was compiled by 'make cross' but not run."; \
+		echo "  Start Docker to execute the systemd tests."; \
+		exit 0; \
+	fi; \
+	tmp=$$(mktemp -d); \
+	trap 'rm -rf "$$tmp"' EXIT; \
+	echo "==> cross-compiling the Linux test binaries"; \
+	for pkg in $$($(GO) list ./...); do \
+		name=$$(echo $$pkg | tr '/.' '__'); \
+		if ! GOOS=linux GOARCH=$$($(GO) env GOARCH) CGO_ENABLED=0 \
+			$(GO) test -c -o "$$tmp/$$name.test" $$pkg 2>/dev/null; then \
+			continue; \
+		fi; \
+		[ -f "$$tmp/$$name.test" ] && echo "$$pkg" >> "$$tmp/packages"; \
+	done; \
+	echo "==> running them in $(LINUX_IMAGE)"; \
+	docker run --rm -v "$$tmp:/tests:ro" -w /tmp $(LINUX_IMAGE) sh -c '\
+		status=0; \
+		for t in /tests/*.test; do \
+			echo "--- $$(basename $$t .test)"; \
+			"$$t" -test.count=1 -test.timeout=300s || status=1; \
+		done; \
+		exit $$status'
 
-          {
-            echo "next=$next"
-            echo "last=$last"
-          } >> "$GITHUB_OUTPUT"
+.PHONY: check
+check: lint cross test test-linux ## Everything a contributor runs before a PR
+	@echo
+	@echo "check: passed"
 
-      - name: Build the release binaries
-        run: |
-          set -euo pipefail
-          next="${{ steps.version.outputs.next }}"
-          mkdir -p dist
-          # The platforms the service package has a manager for, both common
-          # architectures. The binary name carries OS and arch so a release
-          # page lists them unambiguously.
-          #
-          # darwin is omitted for the same reason the test gate pins cross to
-          # linux+windows: the BLE transport pulls in cbgo / CoreBluetooth,
-          # whose cgo bindings do not compile from this Linux runner even with
-          # CGO_ENABLED=0 -- the build fails on undefined CoreBluetooth types.
-          # darwin binaries need a macOS runner, which this flow does not have.
-          for pair in linux/amd64 linux/arm64 windows/amd64 windows/arm64; do
-            os="${pair%/*}"; arch="${pair#*/}"
-            out="dist/stoplight-${next}-${os}-${arch}"
-            [ "$os" = "windows" ] && out="${out}.exe"
-            echo "==> $out"
-            GOOS="$os" GOARCH="$arch" CGO_ENABLED=0 \
-              go build -trimpath -ldflags "-s -w -X main.version=${next}" -o "$out" .
-          done
-          ls -la dist
-
-      - name: Tag the release
-        if: ${{ !inputs.dry_run }}
-        run: |
-          set -euo pipefail
-          next="${{ steps.version.outputs.next }}"
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git tag -a "$next" -m "$next"
-          git push origin "$next"
-
-      - name: Publish the release with generated notes
-        if: ${{ !inputs.dry_run }}
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          next="${{ steps.version.outputs.next }}"
-          last="${{ steps.version.outputs.last }}"
-          # --generate-notes builds the changelog from merged PRs and commits.
-          # --notes-start-tag anchors it at the previous release so the notes
-          # cover exactly this release's range; omitted on the first release,
-          # where there is no earlier tag to start from.
-          args=(release create "$next" dist/* --title "$next" --generate-notes)
-          if [ -n "$last" ]; then
-            args+=(--notes-start-tag "$last")
-          fi
-          gh "${args[@]}"
-
-      - name: Dry run summary
-        if: ${{ inputs.dry_run }}
-        run: |
-          echo "DRY RUN: would release ${{ steps.version.outputs.next }}"
-          echo "No tag was pushed and no release was created."
+.PHONY: clean
+clean: ## Remove the built binary
+	rm -f $(BINARY)
