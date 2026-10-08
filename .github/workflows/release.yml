@@ -19,15 +19,14 @@ on:
         type: boolean
         default: false
 
-# Tagging and creating a release both write to the repo.
 permissions:
-  contents: write
+  contents: write # Tagging and creating a release both write to the repo.
 
 jobs:
   release:
     runs-on: cidekar-anvil
     steps:
-      - name: Refuse to run off main
+      - name: Refuse off main branche run
         if: github.ref != 'refs/heads/main'
         run: |
           echo "::error::release runs on main only; this ref is ${{ github.ref }}"
@@ -36,8 +35,6 @@ jobs:
       - name: Check out full history
         uses: actions/checkout@v6
         with:
-          # The version decision reads every commit since the last tag, and
-          # tags themselves must be present, so a shallow clone will not do.
           fetch-depth: 0
 
       - name: Set up Go
