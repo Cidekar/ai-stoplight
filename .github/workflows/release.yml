@@ -44,21 +44,20 @@ jobs:
         uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
-          
-      - name: Ensure make is present
-        run: |
-          set -euo pipefail
-          if ! command -v make >/dev/null 2>&1; then
-            apt-get update
-            apt-get install -y --no-install-recommends make
-          fi
 
       - name: Run the test gate
         # The same gate contributors run, minus test-linux: that target needs
         # Docker to run the cross-compiled Linux binaries in a container, which
         # the runner may not have. cross still compiles every package for every
         # platform, so a platform-specific build break is still caught.
-        run: make lint cross test
+        #
+        # PLATFORMS is pinned to linux+windows here: the darwin backend of
+        # tinygo.org/x/bluetooth (cbgo / CoreBluetooth) only compiles on a real
+        # macOS host, so cross-vetting GOOS=darwin from this Linux runner fails
+        # on undefined CoreBluetooth types. darwin is covered by a separate
+        # macOS-runner flow. The Makefile default stays linux windows darwin so
+        # local macOS builds still cross-check every platform.
+        run: make lint cross test PLATFORMS="linux windows"
 
       - name: Decide the next version
         id: version
