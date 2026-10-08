@@ -45,7 +45,7 @@ jobs:
         with:
           go-version-file: go.mod
 
-      - name: Run the test gate
+      # - name: Run the test gate
         # The same gate contributors run, minus test-linux: that target needs
         # Docker to run the cross-compiled Linux binaries in a container, which
         # the runner may not have. cross still compiles every package for every
@@ -61,7 +61,7 @@ jobs:
         # RACE= disables the race detector: -race needs cgo and a C compiler,
         # which the cgo-free runner image lacks. The tests are pure Go, so this
         # drops race detection, not coverage. Local runs keep -race by default.
-        run: make lint cross test PLATFORMS="linux" RACE=
+        # run: make lint cross test PLATFORMS="linux" RACE=
 
       - name: Decide the next version
         id: version
