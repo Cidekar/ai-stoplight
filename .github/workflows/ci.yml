@@ -20,4 +20,7 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
-      - run: make check
+      # Pinned to linux: this runner is Linux-only, so vetting and building the
+      # windows and darwin backends (winrt-go, cbgo / CoreBluetooth) fails on
+      # undefined platform types. Drop the pin once osx and windows runners exist.
+      - run: make check PLATFORMS="linux"
