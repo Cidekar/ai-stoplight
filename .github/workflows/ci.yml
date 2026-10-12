@@ -20,6 +20,14 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
+      # TEMPORARY probe: does this runner have cgo and a C compiler? -race needs
+      # both. Remove this step once we know whether to keep -race or drop it.
+      - name: Probe toolchain
+        run: |
+          echo "CGO_ENABLED=$(go env CGO_ENABLED)"
+          echo "CC=$(go env CC)"
+          which gcc cc clang 2>&1 || echo "no C compiler on PATH"
+          gcc --version 2>&1 | head -1 || true
       # Pinned to linux: this runner is Linux-only, so vetting and building the
       # windows and darwin backends (winrt-go, cbgo / CoreBluetooth) fails on
       # undefined platform types. Drop the pin once osx and windows runners exist.
