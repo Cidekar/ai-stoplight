@@ -55,7 +55,8 @@ SOURCES := test_main.cpp \
            $(SRC_DIR)/display.cpp \
            $(SRC_DIR)/lamps.cpp \
            $(SRC_DIR)/button.cpp \
-           $(SRC_DIR)/blelink.cpp
+           $(SRC_DIR)/blelink.cpp \
+           $(SRC_DIR)/standby.cpp
 
 OBJECTS := $(addprefix $(BUILD_DIR)/,$(notdir $(SOURCES:.cpp=.o)))
 
